@@ -5,7 +5,8 @@
  * 由同目录的 `cordis.patch.yml` 插入一行。它是纯 ESM、零依赖的：SMTP 见
  * `smtp.mjs`，邮件组装见 `mime.mjs`，都不引用任何 harness 包或第三方包。
  *
- * 触发点是每一条 `turn/end`（一轮回答结束），正文取该轮最后一条助手消息的文本。
+ * 触发点是每一条 `turn/end`（一轮回答结束），正文取该轮最后一条助手消息的文本，
+ * 标题在固定前缀之后带上这轮回答的摘要（首个标题或首行，可用 `subjectSummary` 关掉）。
  *
  * @module dsh-mail-notify
  */
@@ -61,6 +62,15 @@ const REASON_SUFFIX = {
   interrupted: '（被中断）',
   forked: '（已分叉）',
 }
+
+/** 标题里固定前缀与摘要之间的分隔符。 */
+const SUBJECT_SUMMARY_SEPARATOR = '｜'
+
+/** 首选内容短于这个长度时，再往后接一行，免得标题只有「好的」两个字。 */
+const SUBJECT_SUMMARY_MIN_CHARS = 8
+
+/** 拼摘要时最多看几条候选行。 */
+const SUBJECT_SUMMARY_MAX_LINES = 3
 
 /** 结束原因的中文描述，用于正文兜底和可选页脚。 */
 const REASON_TEXT = {
@@ -221,6 +231,8 @@ export function normalizeConfig(raw) {
     from,
     to: to.map((value, index) => requireAddress(value, `config.to[${index}]`)),
     subject: optionalNonEmptyString(config.subject, 'config.subject') ?? DEFAULT_SUBJECT,
+    subjectSummary: optionalBoolean(config.subjectSummary, 'config.subjectSummary', true),
+    subjectSummaryChars: optionalPositiveInt(config.subjectSummaryChars, 'config.subjectSummaryChars', 40),
     authCode: optionalNonEmptyString(config.authCode, 'config.authCode'),
     authCodeEnv: optionalNonEmptyString(config.authCodeEnv, 'config.authCodeEnv') ?? 'QQ_SMTP_AUTH_CODE',
     authCodeFile: optionalNonEmptyString(config.authCodeFile, 'config.authCodeFile') ?? resolvePath(HERE, 'secret.txt'),
@@ -278,16 +290,106 @@ function describeReason(reason) {
 }
 
 /**
- * 汇总本轮邮件正文：默认只取最后一条助手消息，可配置成拼接整轮。
+ * 按字符（而不是 UTF-16 码元）截断，避免把 emoji 或代理对切成半个。
+ * @param {string} text - 原文本。
+ * @param {number} limit - 最多保留多少个字符。
+ * @returns {string} 截断后的文本；被截断时以省略号结尾。
+ */
+function clipCharacters(text, limit) {
+  const characters = Array.from(text)
+  if (characters.length <= limit) return text
+  return `${characters.slice(0, limit).join('').trimEnd()}…`
+}
+
+/**
+ * 把一行 Markdown 还原成纯文本：剥掉图片/链接语法、引用与列表标记、强调符号与表格竖线。
+ * @param {string} line - 原始行。
+ * @returns {string} 清理并压缩空白后的文本。
+ */
+function plainTextLine(line) {
+  return line
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/^\s{0,3}>+\s?/, '')
+    .replace(/^\s{0,3}(?:#{1,6}\s*|[-*+]\s+|\d+[.)]\s+)/, '')
+    .replace(/[*_`~]/g, '')
+    .replace(/\|/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * 从本轮回答里摘一句能进标题的话。
+ *
+ * 纯本地推断，不调模型、不联网：跳过代码块，优先用第一个 Markdown 标题，否则用第一行；
+ * 首选内容太短就往后接一行，让标题能自解释；最后按 `limit` 个字符截断。
+ * @param {string} text - 本轮回答文本。
+ * @param {number} limit - 摘要最多多少个字符。
+ * @returns {string} 摘要；文本里没有可用内容（例如只有代码块）时返回空串。
+ */
+function summarizeText(text, limit) {
+  /** @type {string[]} 清理后的候选行。 */
+  const candidates = []
+  let inFence = false
+  let heading = -1
+  for (const raw of text.split(/\r?\n/)) {
+    if (/^\s{0,3}(?:```|~~~)/.test(raw)) {
+      inFence = !inFence
+      continue
+    }
+    if (inFence) continue
+
+    const line = plainTextLine(raw)
+    // 空行、表格分隔线（|---|---|）和纯符号行都不是内容。
+    if (line === '' || /^[-:.\s]+$/.test(line)) continue
+    if (heading === -1 && /^\s{0,3}#{1,6}\s/.test(raw)) heading = candidates.length
+    candidates.push(line)
+  }
+  if (candidates.length === 0) return ''
+
+  const start = heading === -1 ? 0 : heading
+  let summary = candidates[start]
+  const last = Math.min(candidates.length, start + SUBJECT_SUMMARY_MAX_LINES)
+  for (let index = start + 1; index < last && summary.length < SUBJECT_SUMMARY_MIN_CHARS; index += 1) {
+    summary = `${summary} ${candidates[index]}`
+  }
+  return clipCharacters(summary, limit)
+}
+
+/**
+ * 拼标题：固定前缀 + 结束原因后缀 + 本轮回答的摘要。
+ * @param {object} config - 归一化后的配置。
+ * @param {string} suffix - 结束原因后缀；正常完成时为空串。
+ * @param {string} text - 本轮回答文本。
+ * @returns {string} 邮件主题。
+ */
+function composeSubject(config, suffix, text) {
+  const summary = config.subjectSummary ? summarizeText(text, config.subjectSummaryChars) : ''
+  if (summary === '') return `${config.subject}${suffix}`
+  return `${config.subject}${suffix}${SUBJECT_SUMMARY_SEPARATOR}${summary}`
+}
+
+/**
+ * 选取本轮进邮件的助手文本：默认只取最后一条，可配置成拼接整轮。
+ * @param {object} config - 归一化后的配置。
+ * @param {{ steps: string[] }} open - 本轮已经收集到的助手文本。
+ * @returns {string} 去掉首尾空白的合并文本。
+ */
+function selectAnswerText(config, open) {
+  const steps = config.mergeSteps ? open.steps : open.steps.slice(-1)
+  return steps.join('\n\n').trim()
+}
+
+/**
+ * 汇总本轮邮件正文。
  * @param {object} config - 归一化后的配置。
  * @param {object} session - 结束这一轮的会话。
  * @param {{ turn: number, reason: object }} event - `turn/end` 事件的 `data`。
- * @param {{ steps: string[] }} open - 本轮已经收集到的助手文本。
+ * @param {string} text - `selectAnswerText` 选出的回答文本。
  * @returns {string} 邮件正文。
  */
-function composeBody(config, session, event, open) {
-  const steps = config.mergeSteps ? open.steps : open.steps.slice(-1)
-  let body = steps.join('\n\n').trim()
+function composeBody(config, session, event, text) {
+  let body = text
   if (body === '') body = `（本轮没有产生文本回答，结束原因：${describeReason(event.reason)}）`
 
   if (body.length > config.maxBodyChars) {
@@ -310,8 +412,10 @@ function composeBody(config, session, event, open) {
  * @throws {Error} 缺少授权码，或 SMTP 投递失败时。
  */
 async function deliver(ctx, config, session, event, open) {
-  const subject = `${config.subject}${REASON_SUFFIX[event.reason.kind] ?? `（${event.reason.kind}）`}`
-  const body = composeBody(config, session, event, open)
+  const text = selectAnswerText(config, open)
+  const suffix = REASON_SUFFIX[event.reason.kind] ?? `（${event.reason.kind}）`
+  const subject = composeSubject(config, suffix, text)
+  const body = composeBody(config, session, event, text)
 
   if (config.dryRun) {
     ctx.logger.info(
@@ -428,6 +532,11 @@ function renderStatus(state) {
     lines.push(`发件：${config.user}`)
     lines.push(`收件：${config.to.join(', ')}`)
     lines.push(`主题：${config.subject}${config.mergeSteps ? '（正文拼接整轮）' : '（正文取最后一条回答）'}`)
+    lines.push(
+      config.subjectSummary
+        ? `标题摘要：开启，最多 ${config.subjectSummaryChars} 字，取回答里的第一个标题或首行`
+        : '标题摘要：关闭，标题只有固定前缀加结束原因',
+    )
     lines.push(`授权码：${describeAuthCodeSource(config)}`)
   }
   lines.push(`本包配置：${CONFIG_FILE}`)
@@ -450,6 +559,7 @@ function renderGuide() {
     '',
     '  只写这几个字段就够：host/port/secure 会按发件域名自动推断（qq.com → smtp.qq.com:465），',
     '  其余字段（主题、超时、正文长度上限等）都有默认值。',
+    '  标题默认带摘要：「DSH 任务完成｜本轮回答的标题或首行」，不想要就写 subjectSummary: false。',
     '  注意 patch 是整体替换 config：这段会覆盖本包 cordis.patch.yml 里的默认值，所以要从 enabled 开始写全。',
     '',
     '第 2 步 · 放授权码',

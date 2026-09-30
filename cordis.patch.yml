@@ -37,6 +37,10 @@
         to:
           - you@example.com
         subject: DSH 任务完成
+        # 标题是否在固定前缀之后带上本轮回答的摘要：「DSH 任务完成｜路径已改好」。
+        subjectSummary: true
+        # 摘要最多几个字，超出按字符截断并加省略号。
+        subjectSummaryChars: 40
         authCodeEnv: QQ_SMTP_AUTH_CODE
         skipSubagentSessions: true
         mergeSteps: false

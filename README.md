@@ -1,7 +1,8 @@
 # dsh-mail-notify
 
 DeepSeek Harness 插件：agent **每结束一轮回答**（会话日志里的 `turn/end`）就发一封通知邮件，
-正文是该轮的回答文本。
+正文是该轮的回答文本，标题在固定前缀之后**带上这轮回答的摘要**（`DSH 任务完成｜路径已改好`），
+这样不用点开邮件就能从收件箱看出每轮干了什么。
 
 - **零依赖**：SMTP 客户端（`smtp.mjs`）和邮件组装（`mime.mjs`）只用 Node 内置模块，不需要 `pnpm add` 任何东西。
 - **零构建**：纯 ESM `.mjs`，直接就是运行时代码。
@@ -24,7 +25,7 @@ DeepSeek Harness 插件：agent **每结束一轮回答**（会话日志里的 `
 
 ## 装之前先看：它为什么不会拖垮 dsh
 
-三条硬保证，都有测试兜着（`node --test`，15 个用例）：
+三条硬保证，都有测试兜着（`node --test`，22 个用例）：
 
 1. **没启用就不碰任何东西。** `enabled: false` 时 `apply` 在注册 `session/event` 监听器之前就返回，
    不响应任何会话事件，也没有网络或文件动作。
@@ -130,7 +131,9 @@ QQ 邮箱要用「设置 → 账户 → POP3/IMAP/SMTP 服务」里生成的**�
 | `smtp.port` | 推断值 | 隐式 TLS 默认 465，STARTTLS 默认 587 |
 | `smtp.secure` | 推断值 | `true` = 465 隐式 TLS，`false` = EHLO 后 STARTTLS |
 | `to` | 必填 | 收件人数组；每人单独投递，互相看不到地址 |
-| `subject` | `DSH 任务完成` | 非正常结束时自动补后缀，如「（已取消）」「（出错）」 |
+| `subject` | `DSH 任务完成` | 标题固定前缀；非正常结束时自动补后缀，如「（已取消）」「（出错）」 |
+| `subjectSummary` | `true` | 标题是否带本轮回答的摘要：「前缀（结束原因）｜摘要」 |
+| `subjectSummaryChars` | `40` | 摘要最多几个字，按字符截断并加省略号 |
 | `authCode` | 无 | 内联授权码，不推荐 |
 | `authCodeEnv` | `QQ_SMTP_AUTH_CODE` | 授权码环境变量名 |
 | `authCodeFile` | 本目录 `secret.txt` | 授权码文件路径，相对路径以本目录为基准 |
@@ -146,10 +149,26 @@ QQ 邮箱要用「设置 → 账户 → POP3/IMAP/SMTP 服务」里生成的**�
 `gmail.com` → `smtp.gmail.com:465`；`outlook.com` / `hotmail.com` / `live.com` → `smtp.office365.com:587` STARTTLS；
 `icloud.com` / `me.com` → `smtp.mail.me.com:587` STARTTLS。其他域名请显式写全 `smtp.host`/`port`/`secure`。
 
+### 标题里的摘要
+
+摘要是**本地推断**出来的，不调模型、不联网、不额外花钱：跳过代码块，优先取回答里第一个
+Markdown 标题，没有标题就取第一行；首选内容短于 8 个字就往后接一行（最多三条候选行），
+让「好的」这种标题能自解释；最后按 `subjectSummaryChars` 个字符截断并加省略号。
+Markdown 标记（`#`、列表符、`**`、链接、表格竖线）都会被剥掉。
+
+```
+DSH 任务完成｜邮件标题已带摘要
+DSH 任务完成（出错）｜沙箱拒绝了这次写入
+DSH 任务完成｜路径已改成 C:/tmp
+```
+
+结束原因后缀排在摘要**之前**，所以出错、被取消这类结果在收件箱里一眼可见。
+不想要摘要就把 `subjectSummary` 设成 `false`，标题回到只有前缀加结束原因。
+
 ## 自检与测试
 
 ```powershell
-node --test          # 15 个用例：惰性保证 + 引导工具 + 正文/主题/子代理行为，不联网不发信
+node --test          # 22 个用例：惰性保证 + 引导工具 + 正文/标题摘要/子代理行为，不联网不发信
 node selftest.mjs    # 真的发一封固定主题的邮件，验证网络、TLS、授权码、中文编码
 ```
 

@@ -73,6 +73,9 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
  */
 const delivered = (logs) => logs.find((entry) => entry.text.includes('body='))
 
+/** 从 dryRun 日志里取出真正会用的主题。 */
+const subjectOf = (logs) => delivered(logs).text.match(/subject=(.*?) to=/)[1]
+
 /** 干燥运行的基础配置：dryRun 保证测试永远不碰网络。 */
 const baseConfig = (extra = {}) => ({
   smtp: { user: 'someone@qq.com' },
@@ -154,6 +157,7 @@ test('引导工具：未启用时 status 明确说不会发信', async () => {
   assert.match(status.text, /未启用/)
   assert.match(status.text, /不会发信/)
   assert.match(status.text, /smtp\.qq\.com:465/)
+  assert.match(status.text, /标题摘要：开启，最多 40 字/)
 })
 
 test('引导工具：读不到授权码时 test 不抛异常，而是返回引导', async () => {
@@ -251,4 +255,92 @@ test('没有助手文本时用结束原因兜底，仍然发信', async () => {
   await flush()
 
   assert.match(delivered(logs).text, /（已取消）/)
+})
+
+test('标题摘要：优先取回答里的第一个 Markdown 标题', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig())
+
+  const session = sessionOf()
+  handlers[0](session, assistantEvent(1, 1, '先说一句铺垫。\n\n## 邮件标题已带摘要\n\n细节若干。'))
+  handlers[0](session, turnEndEvent(1))
+  await flush()
+
+  assert.equal(subjectOf(logs), 'DSH 任务完成｜邮件标题已带摘要')
+})
+
+test('标题摘要：没有标题时取首行，跳过代码块与表格分隔线', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig())
+
+  const session = sessionOf()
+  handlers[0](
+    session,
+    assistantEvent(1, 1, '```js\nconst a = 1\n```\n\n| 列 | 值 |\n| --- | --- |\n| 路径 | C:/tmp |\n'),
+  )
+  handlers[0](session, turnEndEvent(1))
+  await flush()
+
+  assert.equal(subjectOf(logs), 'DSH 任务完成｜列 值 路径 C:/tmp')
+})
+
+test('标题摘要：首行太短时往后接一行，让标题能自解释', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig())
+
+  const session = sessionOf()
+  handlers[0](session, assistantEvent(1, 1, '好的\n已把邮件标题改成带摘要的形式。'))
+  handlers[0](session, turnEndEvent(1))
+  await flush()
+
+  assert.equal(subjectOf(logs), 'DSH 任务完成｜好的 已把邮件标题改成带摘要的形式。')
+})
+
+test('标题摘要：超过 subjectSummaryChars 时截断并加省略号', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig({ subjectSummaryChars: 10 }))
+
+  const session = sessionOf()
+  handlers[0](session, assistantEvent(1, 1, '这是一句很长的回答文本用于验证截断行为'))
+  handlers[0](session, turnEndEvent(1))
+  await flush()
+
+  assert.equal(subjectOf(logs), 'DSH 任务完成｜这是一句很长的回答文…')
+})
+
+test('subjectSummary: false —— 标题回到纯前缀加结束原因', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig({ subjectSummary: false }))
+
+  const session = sessionOf()
+  handlers[0](session, assistantEvent(1, 1, '## 这个标题不该进标题'))
+  handlers[0](session, turnEndEvent(1))
+  await flush()
+
+  assert.equal(subjectOf(logs), 'DSH 任务完成')
+})
+
+test('结束原因排在摘要之前：出错时标题仍一眼看出结果', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig())
+
+  const session = sessionOf()
+  handlers[0](session, assistantEvent(7, 1, '## 沙箱拒绝了这次写入'))
+  handlers[0](session, turnEndEvent(7, 'error'))
+  await flush()
+
+  assert.equal(subjectOf(logs), 'DSH 任务完成（出错）｜沙箱拒绝了这次写入')
+})
+
+test('标题摘要：回答里只有代码块时不加分隔符', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig())
+
+  const session = sessionOf()
+  handlers[0](session, assistantEvent(1, 1, '```\nconst a = 1\n```'))
+  handlers[0](session, turnEndEvent(1))
+  await flush()
+
+  assert.equal(subjectOf(logs), 'DSH 任务完成')
+  assert.ok(!delivered(logs).text.includes('｜'))
 })
