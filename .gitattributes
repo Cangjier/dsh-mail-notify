@@ -1,0 +1,2 @@
+# 仓库内统一用 LF，避免 Windows 检出时产生无意义的行尾 diff。
+* text=auto eol=lf

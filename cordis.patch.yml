@@ -1,0 +1,30 @@
+# dsh-mail-notify bundle patch.
+#
+# 这里是一份可直接用的默认配置：插件、默认收件人和默认主题都在这一行里。
+# 想改成别的邮箱，有两种办法：
+#   1. 直接改这里的 config（本插件是你私有的，不是发布包）；
+#   2. 在 profile 的 cordis.patch.yml 里用 `- id: mail-notify` 覆盖。
+#      注意 patch 是**整体替换** config，不是深合并：覆盖时要把所有字段写全。
+#
+# 授权码不在这里：优先读 authCodeEnv 指的环境变量，再读插件目录下的 secret.txt
+# （也就是 package.json 同级、与 index.mjs 同目录的那个文件）。
+
+- insert:
+    - id: mail-notify
+      name: 'dsh-mail-notify'
+      config:
+        # 默认关闭：装好、重启之后也是纯惰性的——不注册监听器、不连网络、不发信。
+        # 想启用时把这里改成 true（或在 profile 的 cordis.patch.yml 里整体覆盖 config）。
+        enabled: false
+        smtp:
+          user: moodlee@qq.com
+          from: moodlee@qq.com
+        to:
+          - moodlee@qq.com
+        subject: DSH 任务完成
+        authCodeEnv: QQ_SMTP_AUTH_CODE
+        skipSubagentSessions: true
+        mergeSteps: false
+        maxBodyChars: 20000
+        includeSessionInfo: false
+        dryRun: false
