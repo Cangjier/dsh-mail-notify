@@ -1,14 +1,19 @@
 /**
  * 不经过 dsh 的自检脚本：走一遍 配置解析 -> 邮件组装 -> SMTP 投递。
  *
- *   node selftest.mjs
+ *   node selftest.mjs <发件邮箱> [收件邮箱...]
+ *   node selftest.mjs you@qq.com
+ *   node selftest.mjs you@qq.com someone@163.com another@gmail.com
  *
- * 收件人取自 cordis.patch.yml 里同名的默认配置，发的是固定主题，方便你在
- * 装进 profile 之前先确认网络、TLS、授权码和中文编码都没问题。
+ * 也可以只给环境变量：
+ *   MAIL_NOTIFY_USER=you@qq.com node selftest.mjs
+ *
+ * 收件人省略时发给自己。授权码默认从本目录的 secret.txt 读
+ * （AUTH_CODE_FILE 环境变量可以改路径）。
  */
 
 import { readFileSync } from 'node:fs'
-import { dirname, resolve as resolvePath } from 'node:path'
+import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { normalizeConfig } from './index.mjs'
@@ -17,25 +22,33 @@ import { sendMail } from './smtp.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
+const [fromArgument, ...toArguments] = process.argv.slice(2)
+const from = fromArgument ?? process.env.MAIL_NOTIFY_USER
+if (typeof from !== 'string' || from === '') {
+  console.error('用法: node selftest.mjs <发件邮箱> [收件邮箱...]')
+  console.error('  或: MAIL_NOTIFY_USER=you@qq.com node selftest.mjs')
+  process.exit(1)
+}
+
 const config = normalizeConfig({
-  smtp: { user: 'moodlee@qq.com', from: 'moodlee@qq.com' },
-  to: ['moodlee@qq.com'],
+  smtp: { user: from, from },
+  to: toArguments.length > 0 ? toArguments : [from],
   subject: 'DSH mail-notify self-test',
+  authCodeFile: process.env.AUTH_CODE_FILE,
 })
 
 console.log(`endpoint: ${config.host}:${config.port} secure=${config.secure}`)
-console.log(`from: ${config.from}`)
-console.log(`to:   ${config.to.join(', ')}`)
+console.log(`from:     ${config.from}`)
+console.log(`to:       ${config.to.join(', ')}`)
 
-const secretPath = resolvePath(HERE, 'secret.txt')
-const authCode = readFileSync(secretPath, 'utf8').replace(/\s+/g, '')
-console.log(`auth code: ${authCode.length} chars from ${secretPath}`)
+const authCode = readFileSync(config.authCodeFile, 'utf8').replace(/\s+/g, '')
+console.log(`auth code: ${authCode.length} 位，来自 ${config.authCodeFile}`)
 
 const body = [
   '这是一封 dsh-mail-notify 的自检邮件。',
   '',
   '收到它说明以下环节都正常：',
-  '1. 按发件域名推断出 SMTP 端点（qq.com -> smtp.qq.com:465，隐式 TLS）',
+  `1. 按发件域名推断出 SMTP 端点（${config.host}:${config.port}）`,
   '2. TLS 握手与证书校验',
   '3. AUTH 认证（授权码）',
   '4. 中文主题的 RFC 2047 编码与 base64 正文',
@@ -43,7 +56,7 @@ const body = [
   '以点号开头的行测试：',
   '. 这一行以句点开头，不应被当成 DATA 结束标记',
   '',
-  '—— dsh-mail-notify',
+  `—— dsh-mail-notify 自检（${HERE}）`,
 ].join('\n')
 
 for (const recipient of config.to) {

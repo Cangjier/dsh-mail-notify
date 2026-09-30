@@ -1,26 +1,41 @@
 # dsh-mail-notify bundle patch.
 #
-# 这里是一份可直接用的默认配置：插件、默认收件人和默认主题都在这一行里。
-# 想改成别的邮箱，有两种办法：
-#   1. 直接改这里的 config（本插件是你私有的，不是发布包）；
-#   2. 在 profile 的 cordis.patch.yml 里用 `- id: mail-notify` 覆盖。
-#      注意 patch 是**整体替换** config，不是深合并：覆盖时要把所有字段写全。
+# 这里只放**占位值**和出厂默认（enabled: false）。
+# 真实邮箱写在 profile 自己的 cordis.patch.yml 覆盖层里，公开仓库就不会留下你的地址：
 #
-# 授权码不在这里：优先读 authCodeEnv 指的环境变量，再读插件目录下的 secret.txt
-# （也就是 package.json 同级、与 index.mjs 同目录的那个文件）。
+#   - id: mail-notify
+#     name: 'dsh-mail-notify'
+#     config:
+#       enabled: true
+#       smtp:
+#         user: 你的账号@qq.com
+#         from: 你的账号@qq.com
+#       to:
+#         - 收件人@qq.com
+#
+# 注意 patch 是整体替换 config，不是深合并：覆盖时要从 enabled 开始写全。
+# host / port / secure 会按发件域名自动推断（qq.com → smtp.qq.com:465），不必手写。
+#
+# 授权码不放这里：优先读 authCodeEnv 指的环境变量，再读本目录下的 secret.txt。
+#
+# 装好后让 Agent 调用 mail_notify 工具即可自助配置：
+#   action: guide   给出上面这段可粘贴的配置和授权码该放哪
+#   action: status  报告当前到底会不会发信
+#   action: test    立刻真发一封测试邮件
 
 - insert:
     - id: mail-notify
       name: 'dsh-mail-notify'
       config:
         # 默认关闭：装好、重启之后也是纯惰性的——不注册监听器、不连网络、不发信。
-        # 想启用时把这里改成 true（或在 profile 的 cordis.patch.yml 里整体覆盖 config）。
         enabled: false
+        # 占位地址。example.com 不在内置 SMTP 端点表里，所以「只把 enabled 改成 true」
+        # 会得到一条明确的配置错误日志，而不是静默失败。
         smtp:
-          user: moodlee@qq.com
-          from: moodlee@qq.com
+          user: you@example.com
+          from: you@example.com
         to:
-          - moodlee@qq.com
+          - you@example.com
         subject: DSH 任务完成
         authCodeEnv: QQ_SMTP_AUTH_CODE
         skipSubagentSessions: true

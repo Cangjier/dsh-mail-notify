@@ -11,7 +11,7 @@
  */
 
 import { readFileSync } from 'node:fs'
-import { dirname, isAbsolute, resolve as resolvePath } from 'node:path'
+import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { buildMessage } from './mime.mjs'
@@ -359,18 +359,254 @@ function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** 本包的 bundle patch：改 enabled / 发件账号 / 收件人的地方。 */
+const CONFIG_FILE = join(HERE, 'cordis.patch.yml')
+
+/**
+ * profile 自己的覆盖层路径，用户真正该写个人配置的地方。
+ *
+ * 这里放真实邮箱地址而不是本包的 patch，公开仓库里就不会留下个人地址。
+ * @returns {string} 路径；环境变量缺失时返回一段说明。
+ */
+function profilePatchFile() {
+  const home = process.env.DSH_HOME
+  const profile = process.env.DSH_PROFILE
+  if (typeof home === 'string' && home !== '' && typeof profile === 'string' && profile !== '') {
+    return join(home, 'profiles', profile, 'cordis.patch.yml')
+  }
+  return '$DSH_HOME/profiles/<profile>/cordis.patch.yml'
+}
+
+/**
+ * 生成一份可直接粘贴进 profile 覆盖层的配置片段。
+ * @returns {string} YAML 文本。
+ */
+function configurationSnippet() {
+  return [
+    '- id: mail-notify',
+    "  name: 'dsh-mail-notify'",
+    '  config:',
+    '    enabled: true',
+    '    smtp:',
+    '      user: 你的账号@qq.com',
+    '      from: 你的账号@qq.com',
+    '    to:',
+    '      - 收件人@qq.com',
+  ].join('\n')
+}
+
+/**
+ * 描述授权码当前从哪里读、能不能读到。
+ * @param {object} config - 归一化后的配置。
+ * @returns {string} 中文说明。
+ */
+function describeAuthCodeSource(config) {
+  const path = authCodeFilePath(config)
+  if (config.authCode !== null) return 'config.authCode（内联在配置里，不推荐）'
+  const fromEnv = process.env[config.authCodeEnv]
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return `环境变量 ${config.authCodeEnv}（已设置）`
+  if (readAuthCode(config) !== null) return `文件 ${path}（已读到）`
+  return `文件 ${path}（读不到）且环境变量 ${config.authCodeEnv}（未设置）`
+}
+
+/**
+ * 渲染「现在到底会不会发信」的状态报告。
+ * @param {{ config: object | null, failure: string | null }} state - 插件状态。
+ * @returns {string} 多行中文报告。
+ */
+function renderStatus(state) {
+  const { config, failure } = state
+  const lines = []
+  if (failure !== null) lines.push(`状态：配置无效，不会发信 —— ${failure}`)
+  else if (!config.enabled) lines.push('状态：已安装但未启用（config.enabled 为 false），不会发信。')
+  else if (config.dryRun) lines.push('状态：已启用，但 dryRun 为 true，只记日志不发信。')
+  else if (readAuthCode(config) === null) lines.push('状态：已启用，但读不到 SMTP 授权码，不会发信。')
+  else lines.push('状态：已启用，每轮回答结束都会发信。')
+
+  if (config !== null) {
+    lines.push(`SMTP：${config.host}:${config.port}（${config.secure ? '隐式 TLS' : 'EHLO 后 STARTTLS'}）`)
+    lines.push(`发件：${config.user}`)
+    lines.push(`收件：${config.to.join(', ')}`)
+    lines.push(`主题：${config.subject}${config.mergeSteps ? '（正文拼接整轮）' : '（正文取最后一条回答）'}`)
+    lines.push(`授权码：${describeAuthCodeSource(config)}`)
+  }
+  lines.push(`本包配置：${CONFIG_FILE}`)
+  lines.push(`个人覆盖层：${profilePatchFile()}`)
+  return lines.join('\n')
+}
+
+/**
+ * 渲染一份从零到能发信的配置引导。
+ * @returns {string} 多行中文引导。
+ */
+function renderGuide() {
+  return [
+    'dsh-mail-notify 配置引导',
+    '',
+    '第 1 步 · 填发件账号和收件人',
+    `  把下面这段追加到 ${profilePatchFile()} 末尾：`,
+    '',
+    configurationSnippet(),
+    '',
+    '  只写这几个字段就够：host/port/secure 会按发件域名自动推断（qq.com → smtp.qq.com:465），',
+    '  其余字段（主题、超时、正文长度上限等）都有默认值。',
+    '  注意 patch 是整体替换 config：这段会覆盖本包 cordis.patch.yml 里的默认值，所以要从 enabled 开始写全。',
+    '',
+    '第 2 步 · 放授权码',
+    '  QQ 邮箱：设置 → 账户 → POP3/IMAP/SMTP 服务 → 开启服务并生成授权码。',
+    '  授权码是 16 位，不是登录密码。把它单独写进下面这个文件（只有一行）：',
+    `    ${join(HERE, 'secret.txt')}`,
+    `  或者改用一个环境变量，默认读 ${'QQ_SMTP_AUTH_CODE'}。`,
+    '  授权码每次发信都会重新读文件，所以补进去之后不需要重启。',
+    '',
+    '第 3 步 · 生效',
+    '  保存配置文件即可，dsh 会重新加载这一行（profile 层改动要重启）。',
+    '',
+    '验证：调用 mail_notify 工具，action 用 test，会立刻真发一封测试邮件。',
+    '查状态：调用 mail_notify 工具，action 用 status。',
+  ].join('\n')
+}
+
+/**
+ * 注册模型可见的 `mail_notify` 工具：查状态、出引导、试发一封。
+ *
+ * 配置无效时也会注册——那时它正好是把错因和改法讲清楚的唯一入口。
+ * @param {object} toolsCtx - 已经拿到 `tools` 服务的子上下文。
+ * @param {{ config: object | null, failure: string | null }} state - 插件状态。
+ * @param {object} logger - 宿主插件上下文的 logger，用于记录试发结果。
+ * @returns {void}
+ */
+function registerGuideTool(toolsCtx, state, logger) {
+  toolsCtx.tools.register({
+    name: 'mail_notify',
+    description: [
+      'Inspect, configure, or test the dsh-mail-notify plugin, which emails the agent answer when a turn ends.',
+      'action "status" reports whether it will actually send, and which SMTP endpoint it resolved from the sender domain;',
+      'action "guide" returns the exact file paths plus a ready-to-paste YAML snippet for turning it on;',
+      'action "test" sends one real test email immediately (optionally to other recipients via "to").',
+      'Call "guide" whenever the user asks how to set up email notifications, or reports that no mail arrives.',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'guide', 'test'],
+          description: 'status: report the current state. guide: return configuration instructions. test: send a test email now.',
+        },
+        to: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Test-only recipients, for example ["someone@qq.com"]. Defaults to the configured "to" list.',
+        },
+        subject: { type: 'string', description: 'Test-only subject. Defaults to the configured subject plus 「（测试）」.' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(_args, value) {
+        return [{ type: 'text', text: typeof value.text === 'string' ? value.text : JSON.stringify(value, null, 2) }]
+      },
+    },
+    async execute(args) {
+      if (args.action === 'status') return { text: renderStatus(state) }
+      if (args.action === 'guide') return { text: renderGuide() }
+      if (args.action !== 'test') return { text: `未知 action：${String(args.action)}；可用：status、guide、test。` }
+
+      const { config, failure } = state
+      if (config === null) return { text: `无法试发，配置无效：${failure}\n\n${renderGuide()}` }
+
+      const recipients = Array.isArray(args.to) && args.to.length > 0 ? args.to : config.to
+      for (const recipient of recipients) {
+        if (typeof recipient !== 'string' || !ADDRESS_PATTERN.test(recipient)) {
+          return { text: `收件人不是合法邮箱地址：${JSON.stringify(recipient)}` }
+        }
+      }
+
+      const authCode = readAuthCode(config)
+      if (authCode === null) return { text: `无法试发，读不到 SMTP 授权码。\n\n${renderGuide()}` }
+
+      const subject = typeof args.subject === 'string' && args.subject !== '' ? args.subject : `${config.subject}（测试）`
+      const body = [
+        '这是一封 dsh-mail-notify 的测试邮件。',
+        '',
+        '收到它说明 SMTP 链路、TLS、认证和中文主题编码都正常。',
+        '',
+        '—— mail_notify 工具',
+      ].join('\n')
+
+      try {
+        const sentTo = []
+        for (const recipient of recipients) {
+          const message = buildMessage({ from: config.from, to: recipient, subject, body })
+          await sendMail({
+            host: config.host,
+            port: config.port,
+            secure: config.secure,
+            user: config.user,
+            password: authCode,
+            from: config.from,
+            recipients: [recipient],
+            message,
+            timeoutMs: config.timeoutMs,
+          })
+          sentTo.push(recipient)
+        }
+        logger.info(`mail-notify: 测试邮件已发送到 ${sentTo.join(', ')}`)
+        return {
+          text: [
+            `测试邮件已发送到：${sentTo.join(', ')}`,
+            `SMTP：${config.host}:${config.port}`,
+            '',
+            config.enabled
+              ? '插件已启用，之后每轮回答结束都会自动发信。'
+              : '插件当前未启用。把配置里的 enabled 改成 true，之后每轮回答结束就会自动发信。',
+          ].join('\n'),
+          sentTo,
+        }
+      } catch (error) {
+        return { text: `测试发送失败：${messageOf(error)}\n\n${renderGuide()}` }
+      }
+    },
+  })
+}
+
 export function apply(ctx, rawConfig) {
-  let config
+  let config = null
+  let failure = null
   try {
     config = normalizeConfig(rawConfig)
   } catch (error) {
     // 配置写错时保持完全不发信，而不是把异常抛回加载器；原因写进日志。
-    ctx.logger.error(`mail-notify: 配置无效，插件保持不发送状态：${messageOf(error)}`)
+    failure = messageOf(error)
+  }
+  const state = { config, failure }
+
+  // 引导工具是附加能力，配置无效时也要在：它正是把错因和改法讲清楚的入口。
+  // 它注册失败也不能连累发信本身，所以单独兜住。
+  try {
+    ctx.inject(['tools'], (toolsCtx) => {
+      try {
+        registerGuideTool(toolsCtx, state, ctx.logger)
+      } catch (error) {
+        ctx.logger.warn(`mail-notify: 引导工具注册失败（不影响发信）：${messageOf(error)}`)
+      }
+    })
+  } catch (error) {
+    ctx.logger.warn(`mail-notify: 无法注册引导工具（不影响发信）：${messageOf(error)}`)
+  }
+
+  if (failure !== null) {
+    ctx.logger.error(`mail-notify: 配置无效，插件保持不发送状态：${failure}`)
+    ctx.logger.error(`mail-notify: 让 Agent 调用 mail_notify 工具（action: guide）可以拿到改法；本包配置 ${CONFIG_FILE}`)
     return
   }
 
   if (!config.enabled) {
-    ctx.logger.info('mail-notify: config.enabled 为 false，插件不注册监听器，也不会发送任何邮件')
+    ctx.logger.info('mail-notify: 未启用（config.enabled 为 false），不注册监听器、不发送邮件')
+    ctx.logger.info(`mail-notify: 让 Agent 调用 mail_notify 工具（action: guide）可以拿到开启方法`)
     return
   }
   if (config.dryRun) {

@@ -5,30 +5,39 @@ DeepSeek Harness 插件：agent **每结束一轮回答**（会话日志里的 `
 
 - **零依赖**：SMTP 客户端（`smtp.mjs`）和邮件组装（`mime.mjs`）只用 Node 内置模块，不需要 `pnpm add` 任何东西。
 - **零构建**：纯 ESM `.mjs`，直接就是运行时代码。
-- **默认关闭**：装好、重启之后也是纯惰性的——不注册监听器、不连网络、不发信。要把 `enabled` 改成 `true` 才会工作。
+- **默认关闭**：装好、重启之后也是纯惰性的——不注册监听器、不连网络、不发信。
+- **自带配置引导**：注册了一个模型可见的 `mail_notify` 工具，可以直接让 Agent 帮你配好并试发。
 - **收件人任意域名**：发信服务器只由**发件**账号决定；收件人写 `qq.com`、`163.com`、`gmail.com` 都一样能收。
+
+## 让 Agent 帮你配
+
+插件注册了 `mail_notify` 工具，三个 action：
+
+| action | 作用 |
+|---|---|
+| `status` | 报告当前到底会不会发信：SMTP 端点、发件账号、收件人、授权码从哪儿读、有没有读到 |
+| `guide` | 给出配置文件的确切路径，以及一段可直接粘贴的 YAML |
+| `test` | **立刻真发一封测试邮件**（可用 `to` 临时指定别的收件人），验证网络/TLS/授权码/中文编码 |
+
+所以装好之后你只要说「帮我把邮件通知配好」，或者「为什么没收到邮件」，Agent 就能查到原因。
+配置写错时这个工具**照样注册**——那时它正是把错因讲清楚的唯一入口。
 
 ## 装之前先看：它为什么不会拖垮 dsh
 
-有两条硬保证，都有测试兜着（`node --test`）：
+三条硬保证，都有测试兜着（`node --test`，15 个用例）：
 
-1. **没启用就不碰任何东西。** `enabled: false` 时 `apply` 在注册任何监听器之前就返回，
-   所以既不会响应 `session/event`，也没有任何网络或文件动作。
+1. **没启用就不碰任何东西。** `enabled: false` 时 `apply` 在注册 `session/event` 监听器之前就返回，
+   不响应任何会话事件，也没有网络或文件动作。
 2. **配置写错也不抛回加载器。** 缺 `to`、地址非法、发件域名认不出、config 整个是 `undefined`
-   这四种情况都只写一条 `error` 日志然后保持惰性，`apply` 不会抛异常。
+   这四种情况都只写 `error` 日志然后保持惰性。
+3. **引导工具注册失败不影响发信。** 它包在单独的 `try` 里——附加能力不能连累主功能。
 
-测试里对应的 5 个用例就是这四条边界加 `enabled: false`。想自己核实：
-
-```powershell
-node --test
-```
-
-### 为什么这次用 bundle，而不是散装文件
+### 为什么用 bundle，而不是散装文件
 
 第一版把 `.mjs` 直接放在 `profiles/desktop/plugins/` 下，再往 profile 的 `cordis.patch.yml`
 里 `insert` 一行，结果运行中的 dsh 卡死，只能重启恢复。
 profile 内的相对路径插件要靠 HMR 的运行时 reconcile 去 `import` 一个新模块；
-而 bundle 方式是**启动时**解析的（`dsh.profile.bundles`），是这台机器上 `xl` 插件已经验证过的路径。
+而 bundle 方式是**启动时**解析的（`dsh.profile.bundles`），是 `xl` 插件已经验证过的路径。
 所以现在代码放在 profile 目录**之外**，走 bundle。
 
 ## 安装（分三步，每步都可回退）
@@ -39,8 +48,7 @@ profile 内的相对路径插件要靠 HMR 的运行时 reconcile 去 `import` �
 
 ```jsonc
 "dependencies": {
-  "xl": "link:C:/Users/Admin/Documents/GitHub/xl",
-  "dsh-mail-notify": "link:C:/Users/Admin/Documents/GitHub/dsh-mail-notify"   // 新增
+  "dsh-mail-notify": "link:C:/Users/you/Documents/GitHub/dsh-mail-notify"   // 换成你自己的绝对路径
 }
 ```
 
@@ -69,24 +77,31 @@ pnpm install
 
 **完全退出再启动** dsh（bundle 解析变更本来就要重启，这是 dsh 的设计）。
 此时插件已挂载，但 `cordis.patch.yml` 里 `enabled: false`，所以仍然不发信。
-确认 dsh 照常启动。
+可以先用 `mail_notify` 的 `guide` / `test` 把配置弄好再来这一步之后的启用。
 
-### 第 3 步：启用
+### 第 3 步：填个人配置并启用
 
-把本包 `cordis.patch.yml` 里的 `enabled: false` 改成 `true`，重启即可。
-
-也可以在 profile 自己的 `cordis.patch.yml` 里覆盖，但注意 patch 是**整体替换** config，
-不是深合并，字段要写全：
+本包的 `cordis.patch.yml` 里只有**占位地址**（`you@example.com`），真实邮箱写在
+profile 自己的覆盖层 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` 里，
+这样公开仓库不会留下你的地址：
 
 ```yaml
 - id: mail-notify
   name: 'dsh-mail-notify'
   config:
     enabled: true
-    smtp: { user: moodlee@qq.com, from: moodlee@qq.com }
-    to: [moodlee@qq.com]
-    # …其余字段按下面的表补全
+    smtp:
+      user: 你的账号@qq.com
+      from: 你的账号@qq.com
+    to:
+      - 收件人@qq.com
 ```
+
+patch 是**整体替换** config，不是深合并，所以这段会覆盖本包的默认值——从 `enabled` 开始写全。
+`host` / `port` / `secure` 会按发件域名自动推断，不必手写；其余字段都有代码默认值。
+
+> `example.com` 故意不在内置端点表里：如果只把 `enabled` 改成 `true` 而不填真实地址，
+> 会得到一条明确的配置错误日志，而不是静默失败。
 
 ### 回退
 
@@ -106,11 +121,9 @@ QQ 邮箱要用「设置 → 账户 → POP3/IMAP/SMTP 服务」里生成的**�
 
 ## 配置
 
-配置写在本包的 `cordis.patch.yml` 里。
-
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `enabled` | **`false`** | 本包出厂就是关的。`false` 时不注册监听器、不发信 |
+| `enabled` | **`false`** | 出厂就是关的。`false` 时不注册监听器、不发信 |
 | `smtp.user` | 必填 | SMTP 登录账号（发件邮箱） |
 | `smtp.from` | 同 `user` | 信头里的发件地址 |
 | `smtp.host` | 按发件域名推断 | 认不出的域名必须手填，否则只记错误日志、保持不发信 |
@@ -136,15 +149,14 @@ QQ 邮箱要用「设置 → 账户 → POP3/IMAP/SMTP 服务」里生成的**�
 ## 自检与测试
 
 ```powershell
-node --test          # 10 个用例：惰性保证 + 正文/主题/子代理行为，不联网不发信
+node --test          # 15 个用例：惰性保证 + 引导工具 + 正文/主题/子代理行为，不联网不发信
 node selftest.mjs    # 真的发一封固定主题的邮件，验证网络、TLS、授权码、中文编码
 ```
 
 ## 排查
 
-- **什么都没发生**：先看 `enabled` 是不是还是出厂的 `false`；再看 `dryRun` 是不是 `true`。
-  发送失败的原因以 `mail-notify:` 前缀写进 dsh 日志。
-- **「配置无效，插件保持不发送状态」**：后面跟着具体是哪个字段，改完重启即可。
+- **什么都没发生**：让 Agent 调 `mail_notify` 的 `status`。多半是 `enabled` 还是 `false`，或 `dryRun` 是 `true`。
+- **「配置无效，插件保持不发送状态」**：日志后面跟着具体是哪个字段；用 `mail_notify` 的 `guide` 拿改法。
 - **「没有读到 SMTP 授权码」**：文件为空或路径不对，注意用授权码而不是登录密码。
 - **`535 Authentication failed`**：授权码过期或被重置，重新生成。
 - **「不支持 STARTTLS」**：`secure: false` 且服务器没有 STARTTLS 时会直接中止，而不是明文发授权码；改用 465。
