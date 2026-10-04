@@ -1,3 +1,6 @@
 # SMTP 授权码：绝对不要提交到 git。
 secret.txt
 node_modules/
+
+# 收信触发的 UID 水位（本地状态，不含机密，但没有共享价值）。
+reply-state.json

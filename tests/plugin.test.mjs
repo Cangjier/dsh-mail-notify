@@ -45,8 +45,16 @@ function createHarness() {
       })
       return Promise.resolve()
     },
+    // 没有 agents 服务：插件会把「查不到 agent」当成「已经停稳」，于是安静窗口一到就发。
+    get: () => undefined,
+    effect: (callback) => {
+      const dispose = callback()
+      effects.push(dispose)
+      return dispose
+    },
   }
-  return { ctx, registered, handlers, logs, tools }
+  const effects = []
+  return { ctx, registered, handlers, logs, tools, effects }
 }
 
 /** 最简的会话替身：插件只读 id 和 header.cwd / header.origin。 */
@@ -59,6 +67,8 @@ const assistantEvent = (turn, step, text) => ({
   data: { turn, step, message: { content: [{ type: 'text', text }] } },
 })
 
+const turnStartEvent = (turn) => ({ type: 'turn/start', data: { turn } })
+
 const turnEndEvent = (turn, kind = 'completed') => ({
   type: 'turn/end',
   data: { turn, reason: { kind } },
@@ -67,20 +77,40 @@ const turnEndEvent = (turn, kind = 'completed') => ({
 /** 让 apply 里那条 promise 队列跑完。 */
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 
+/** 等一段真实时间（安静窗口是非零时必须真等）。 */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 安静窗口是 0 秒，所以两个 tick 足够让「全部结束」那一封落进日志。 */
+const settle = async () => {
+  await flush()
+  await flush()
+}
+
 /**
  * 取「每轮真正投递」的那条日志。
  * 用 body= 区分：apply 时还会写一条 dryRun 日志，那条不含 body=。
  */
 const delivered = (logs) => logs.find((entry) => entry.text.includes('body='))
 
+/** 取所有投递记录的 dryRun 日志（多轮任务会不止一条）。 */
+const deliveredAll = (logs) => logs.filter((entry) => entry.text.includes('body='))
+
 /** 从 dryRun 日志里取出真正会用的主题。 */
 const subjectOf = (logs) => delivered(logs).text.match(/subject=(.*?) to=/)[1]
+
+/** 取投递记录的 kind（progress / final）。 */
+const kindOf = (entry) => entry.text.match(/kind=(\w+)/)[1]
+
+/** 取 dryRun 正文日志的内容。 */
+const bodyOf = (logs, index = 0) =>
+  logs.filter((entry) => entry.text.includes('dryRun 正文')).at(index)?.text.split('\n').slice(1).join('\n') ?? ''
 
 /** 干燥运行的基础配置：dryRun 保证测试永远不碰网络。 */
 const baseConfig = (extra = {}) => ({
   smtp: { user: 'someone@qq.com' },
   to: ['someone@qq.com'],
   dryRun: true,
+  finalQuietSeconds: 0,
   ...extra,
 })
 
@@ -200,12 +230,72 @@ test('启用后 —— 只注册 session/event，并在 turn/end 时按最后一
   handlers[0](session, assistantEvent(1, 1, 'A'.repeat(10)))
   handlers[0](session, assistantEvent(1, 2, 'B'.repeat(20)))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   const sent = delivered(logs)
   assert.ok(sent, '应记录一条 dryRun 日志')
-  assert.ok(sent.text.includes('body=20 字'), `默认只取最后一步，实际: ${sent.text}`)
-  assert.ok(sent.text.includes('DSH 任务完成'), '正常完成时主题不加后缀')
+  assert.equal(kindOf(sent), 'final', '单轮任务只该收到「全部结束」那一封')
+  assert.ok(subjectOf(logs).startsWith('DSH 任务完成'), '单轮任务直接用「完成」前缀')
+  assert.ok(bodyOf(logs).includes('B'.repeat(20)), '正文要带上这一轮的回答')
+  assert.ok(bodyOf(logs).includes('本次任务已全部结束'), '「全部结束」那一封要说清这是收尾')
+})
+
+test('多轮任务：中途那些轮发「进行中」，最后一轮发「完成」', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  // 安静窗口 1 秒：够测出「一轮结束不立刻发、等下一轮开始才发」这条时序。
+  apply(ctx, baseConfig({ finalQuietSeconds: 1 }))
+
+  const session = sessionOf()
+  // 第一轮
+  handlers[0](session, turnStartEvent(1))
+  handlers[0](session, assistantEvent(1, 1, '第一轮的回答'))
+  handlers[0](session, turnEndEvent(1))
+  await flush()
+  assert.equal(delivered(logs), undefined, '一轮结束先不发，要等看会不会继续')
+
+  // 第二轮开始 —— 说明第一轮只是中途
+  handlers[0](session, turnStartEvent(2))
+  await settle()
+  const progress = deliveredAll(logs)
+  assert.equal(progress.length, 1)
+  assert.equal(kindOf(progress[0]), 'progress')
+  assert.match(subjectOf(logs), /^DSH 任务进行中/)
+  assert.ok(bodyOf(logs).includes('第一轮的回答'))
+
+  // 第二轮结束，并且不再继续
+  handlers[0](session, assistantEvent(2, 1, '第二轮的收尾回答'))
+  handlers[0](session, turnEndEvent(2))
+  await sleep(1200)
+
+  const all = deliveredAll(logs)
+  assert.equal(all.length, 2, '第一轮一封「进行中」+ 第二轮一封「完成」')
+  assert.equal(kindOf(all[1]), 'final')
+  assert.match(all[1].text.match(/subject=(.*?) to=/)[1], /^DSH 任务完成/)
+  assert.ok(bodyOf(logs, 1).includes('第二轮的收尾回答'))
+  assert.ok(bodyOf(logs, 1).includes('（2 轮）'), '收尾那封要说清一共跑了几轮')
+})
+
+test('notifyProgress: false —— 中途不发，只在整段结束时发一封', async () => {
+  const { ctx, handlers, logs } = createHarness()
+  apply(ctx, baseConfig({ finalQuietSeconds: 1, notifyProgress: false }))
+
+  const session = sessionOf()
+  handlers[0](session, turnStartEvent(1))
+  handlers[0](session, assistantEvent(1, 1, '第一轮的回答'))
+  handlers[0](session, turnEndEvent(1))
+  handlers[0](session, turnStartEvent(2))
+  await settle()
+  assert.equal(delivered(logs), undefined, '中途不该发')
+
+  handlers[0](session, assistantEvent(2, 1, '第二轮的回答'))
+  handlers[0](session, turnEndEvent(2))
+  await sleep(1200)
+
+  const all = deliveredAll(logs)
+  assert.equal(all.length, 1)
+  assert.equal(kindOf(all[0]), 'final')
+  assert.ok(bodyOf(logs).includes('第二轮的回答'))
+  assert.equal(bodyOf(logs).includes('第一轮的回答'), false, '低噪音模式只带最后一轮的回答')
 })
 
 test('mergeSteps: true —— 正文拼接整轮所有步骤', async () => {
@@ -216,9 +306,12 @@ test('mergeSteps: true —— 正文拼接整轮所有步骤', async () => {
   handlers[0](session, assistantEvent(1, 1, 'A'.repeat(10)))
   handlers[0](session, assistantEvent(1, 2, 'B'.repeat(20)))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
-  assert.ok(delivered(logs).text.includes('body=32 字'), `10 + 2(空行) + 20 = 32，实际: ${delivered(logs).text}`)
+  const body = bodyOf(logs)
+  assert.ok(body.includes('A'.repeat(10)), '拼接后应含第一步')
+  assert.ok(body.includes('B'.repeat(20)), '拼接后应含第二步')
+  assert.ok(body.includes(`${'A'.repeat(10)}\n\n${'B'.repeat(20)}`), '两步之间用空行分隔')
 })
 
 test('结束原因进主题后缀，不假装是正常完成', async () => {
@@ -228,7 +321,7 @@ test('结束原因进主题后缀，不假装是正常完成', async () => {
   const session = sessionOf()
   handlers[0](session, assistantEvent(7, 1, 'boom'))
   handlers[0](session, turnEndEvent(7, 'error'))
-  await flush()
+  await settle()
 
   assert.match(delivered(logs).text, /（出错）/)
 })
@@ -240,7 +333,7 @@ test('子代理会话被跳过', async () => {
   const session = sessionOf('subagent')
   handlers[0](session, assistantEvent(1, 1, 'subagent text'))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   assert.equal(delivered(logs), undefined, '子代理不该发信')
 })
@@ -252,7 +345,7 @@ test('没有助手文本时用结束原因兜底，仍然发信', async () => {
   const session = sessionOf()
   handlers[0](session, assistantEvent(1, 1, 'something'))
   handlers[0](session, turnEndEvent(1, 'aborted'))
-  await flush()
+  await settle()
 
   assert.match(delivered(logs).text, /（已取消）/)
 })
@@ -264,7 +357,7 @@ test('标题摘要：优先取回答里的第一个 Markdown 标题', async () =
   const session = sessionOf()
   handlers[0](session, assistantEvent(1, 1, '先说一句铺垫。\n\n## 邮件标题已带摘要\n\n细节若干。'))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   assert.equal(subjectOf(logs), 'DSH 任务完成｜邮件标题已带摘要')
 })
@@ -279,7 +372,7 @@ test('标题摘要：没有标题时取首行，跳过代码块与表格分隔�
     assistantEvent(1, 1, '```js\nconst a = 1\n```\n\n| 列 | 值 |\n| --- | --- |\n| 路径 | C:/tmp |\n'),
   )
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   assert.equal(subjectOf(logs), 'DSH 任务完成｜列 值 路径 C:/tmp')
 })
@@ -291,7 +384,7 @@ test('标题摘要：首行太短时往后接一行，让标题能自解释', as
   const session = sessionOf()
   handlers[0](session, assistantEvent(1, 1, '好的\n已把邮件标题改成带摘要的形式。'))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   assert.equal(subjectOf(logs), 'DSH 任务完成｜好的 已把邮件标题改成带摘要的形式。')
 })
@@ -303,7 +396,7 @@ test('标题摘要：超过 subjectSummaryChars 时截断并加省略号', async
   const session = sessionOf()
   handlers[0](session, assistantEvent(1, 1, '这是一句很长的回答文本用于验证截断行为'))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   assert.equal(subjectOf(logs), 'DSH 任务完成｜这是一句很长的回答文…')
 })
@@ -315,7 +408,7 @@ test('subjectSummary: false —— 标题回到纯前缀加结束原因', async 
   const session = sessionOf()
   handlers[0](session, assistantEvent(1, 1, '## 这个标题不该进标题'))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   assert.equal(subjectOf(logs), 'DSH 任务完成')
 })
@@ -327,7 +420,7 @@ test('结束原因排在摘要之前：出错时标题仍一眼看出结果', as
   const session = sessionOf()
   handlers[0](session, assistantEvent(7, 1, '## 沙箱拒绝了这次写入'))
   handlers[0](session, turnEndEvent(7, 'error'))
-  await flush()
+  await settle()
 
   assert.equal(subjectOf(logs), 'DSH 任务完成（出错）｜沙箱拒绝了这次写入')
 })
@@ -339,7 +432,7 @@ test('标题摘要：回答里只有代码块时不加分隔符', async () => {
   const session = sessionOf()
   handlers[0](session, assistantEvent(1, 1, '```\nconst a = 1\n```'))
   handlers[0](session, turnEndEvent(1))
-  await flush()
+  await settle()
 
   assert.equal(subjectOf(logs), 'DSH 任务完成')
   assert.ok(!delivered(logs).text.includes('｜'))

@@ -9,6 +9,10 @@
     ".": "./index.mjs",
     "./smtp": "./smtp.mjs",
     "./mime": "./mime.mjs",
+    "./imap": "./imap.mjs",
+    "./mail": "./mail.mjs",
+    "./reply": "./reply.mjs",
+    "./workspace": "./workspace.mjs",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
@@ -16,6 +20,10 @@
     "index.mjs",
     "smtp.mjs",
     "mime.mjs",
+    "imap.mjs",
+    "mail.mjs",
+    "reply.mjs",
+    "workspace.mjs",
     "selftest.mjs",
     "cordis.patch.yml",
     "README.md"
@@ -28,7 +36,7 @@
   "scripts": {
     "test": "node --test",
     "selftest": "node selftest.mjs",
-    "check": "node --check index.mjs && node --check smtp.mjs && node --check mime.mjs"
+    "check": "node --check index.mjs && node --check smtp.mjs && node --check mime.mjs && node --check imap.mjs && node --check mail.mjs && node --check reply.mjs && node --check workspace.mjs"
   },
   "engines": {
     "node": ">=20"
