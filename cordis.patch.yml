@@ -38,18 +38,37 @@
           - you@example.com
         subject: DSH 任务完成
         # 一个任务常要连跑好几轮（turn/end 之后还会继续），所以标题分两种：
-        # 中途每轮用「进行中」，整段跑完（agent 停稳）那一封用上面的「完成」。
+        # 中途每轮用「进行中」，整段跑完（agent 停稳、且名下没有子代理在跑）那一封用上面的「完成」。
         subjectProgress: DSH 任务进行中
         # 中途那些轮是否各发一封；false = 一个任务只发一封（正文只带最后一轮的回答）。
         notifyProgress: true
+        # agent 提问（ask_user_question）时也立刻发一封：它会让这一轮停在原地等人回答，
+        # 所以正文列出问题与选项、提醒你回 DSH 界面回答；false = 提问时不发信。
+        notifyQuestions: true
+        # 提问通知的标题前缀；标题摘要开启时后面会接「｜第一条问题的摘要」。
+        subjectQuestion: DSH 等待你的回答
         # 安静多少秒没再继续，才认为这一波任务真的结束了（0 = 不等，立刻算结束）。
         finalQuietSeconds: 5
+        # 父会话 idle 但名下还有子代理（Agent Teams 成员等）在跑时，不会报「任务完成」：
+        # 中途通知开着就改发「DSH 任务进行中（N 个子代理仍在跑）｜摘要」，
+        # 关着就等子代理跑完再发收尾那封。
         # 标题是否在固定前缀之后带上本轮回答的摘要：「DSH 任务完成｜路径已改好」。
         subjectSummary: true
         # 摘要最多几个字，超出按字符截断并加省略号。
         subjectSummaryChars: 40
         authCodeEnv: QQ_SMTP_AUTH_CODE
         skipSubagentSessions: true
+        # 这些输入来源（user/message 的 source.kind）发起的轮次整轮不发信：
+        # 既不发中途的「进行中」，也不发「完成」，也不会把上一轮降级成「进行中」。
+        # 默认只跳 schedule —— dsh-schedule 的定时提醒：提醒正文不是「你的任务」，
+        # 为它发一封「DSH 任务完成」只会是噪音。写 [] = 一个都不跳。
+        # 想连本插件自己投递的邮件（= 你回复邮件触发的那一轮）一起跳，就加
+        # cordis-host-runner：注意「回信」就是那条通知本身，加了之后回复邮件就
+        # 收不到答案邮件；而且那个 kind 同时被宿主动态插件 runner 的失败上报使用，
+        # 所以加它也会让那些通知静音。要跳别的自动化来源（goal/webhook/tool-jobs…）
+        # 照此往下列即可，没写的来源一律照常发信。
+        skipSources:
+          - schedule
         mergeSteps: false
         maxBodyChars: 20000
         includeSessionInfo: false

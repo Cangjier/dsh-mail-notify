@@ -47,6 +47,23 @@ test('通知节奏：两种主题前缀、中途通知开关、安静窗口（�
   assert.throws(() => normalizeConfig({ ...base(undefined), finalQuietSeconds: -1 }), /finalQuietSeconds 必须是非负整数/)
 })
 
+test('提问通知：默认开启、可关、标题前缀可改，类型写错在加载时就报错', () => {
+  const defaults = normalizeConfig(base(undefined))
+  assert.equal(defaults.notifyQuestions, true, '默认：agent 提问时也发一封')
+  assert.equal(defaults.subjectQuestion, 'DSH 等待你的回答')
+
+  const custom = normalizeConfig({
+    ...base(undefined),
+    notifyQuestions: false,
+    subjectQuestion: '等你拍板',
+  })
+  assert.equal(custom.notifyQuestions, false)
+  assert.equal(custom.subjectQuestion, '等你拍板')
+
+  assert.throws(() => normalizeConfig({ ...base(undefined), notifyQuestions: 'yes' }), /notifyQuestions 必须是布尔值/)
+  assert.throws(() => normalizeConfig({ ...base(undefined), subjectQuestion: '  ' }), /subjectQuestion 必须是非空字符串/)
+})
+
 test('reply：默认关闭，且关闭时不要求能推断出 IMAP 服务器', () => {
   const config = normalizeConfig(unknownDomain(undefined))
   assert.equal(config.reply.enabled, false)
@@ -133,4 +150,28 @@ test('reply：与发信开关相互独立', () => {
   const onlyReply = normalizeConfig({ ...base({ enabled: true }), enabled: false })
   assert.equal(onlyReply.enabled, false, '不发通知')
   assert.equal(onlyReply.reply.enabled, true, '但仍然收信触发')
+})
+
+test('skipSources：默认只跳定时任务，可加来源、可写空数组关掉', () => {
+  assert.deepEqual(normalizeConfig(base(undefined)).skipSources, ['schedule'], '默认只跳 dsh-schedule 的定时提醒')
+  assert.deepEqual(normalizeConfig({ ...base(undefined), skipSources: [] }).skipSources, [], '空数组 = 一个都不跳')
+  assert.deepEqual(
+    normalizeConfig({ ...base(undefined), skipSources: ['schedule', 'goal'] }).skipSources,
+    ['schedule', 'goal'],
+    '顺序与内容原样保留，status 会把它们报回去',
+  )
+  assert.deepEqual(
+    normalizeConfig({ ...base(undefined), skipSources: [' cordis-host-runner '] }).skipSources,
+    ['cordis-host-runner'],
+    '每项去掉首尾空白',
+  )
+  assert.throws(() => normalizeConfig({ ...base(undefined), skipSources: 'schedule' }), /skipSources 必须是字符串数组/)
+  assert.throws(() => normalizeConfig({ ...base(undefined), skipSources: ['schedule', '  '] }), /skipSources\[1\] 必须是非空字符串/)
+  assert.throws(() => normalizeConfig({ ...base(undefined), skipSources: [42] }), /skipSources\[0\] 必须是非空字符串/)
+})
+
+test('skipSources：默认值不被调用方改坏（冻结的出厂默认每次都要拷一份）', () => {
+  const first = normalizeConfig({ ...base(undefined), skipSources: undefined })
+  first.skipSources.push('goal')
+  assert.deepEqual(normalizeConfig(base(undefined)).skipSources, ['schedule'], '改一次配置不该污染下一次的默认值')
 })

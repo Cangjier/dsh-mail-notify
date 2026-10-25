@@ -50,14 +50,16 @@ function createClock() {
   }
 }
 
-/** 造一个调度器 + 记录投递内容。 */
-function createScheduler({ notifyProgress = true, quietSeconds = 5, idle = true, sessionId = 's-1' } = {}) {
+/** 造一个调度器 + 记录投递内容。`subagents` 是「名下正在跑的子代理会话数」。 */
+function createScheduler({ notifyProgress = true, quietSeconds = 5, idle = true, sessionId = 's-1', subagents = 0 } = {}) {
   const clock = createClock()
   const sent = []
   const idleness = { value: idle }
+  const subagentState = { value: subagents }
   const scheduler = createTurnScheduler({
     config: { finalQuietSeconds: quietSeconds, notifyProgress },
     isIdle: () => idleness.value,
+    runningSubagents: () => subagentState.value,
     deliver: (payload) => {
       sent.push(payload)
     },
@@ -65,7 +67,7 @@ function createScheduler({ notifyProgress = true, quietSeconds = 5, idle = true,
     cancel: clock.cancel,
   })
   const session = { id: sessionId, header: {} }
-  return { scheduler, sent, clock, session, idleness }
+  return { scheduler, sent, clock, session, idleness, subagentState }
 }
 
 /** 造一条 turn/end 事件。 */
@@ -193,6 +195,50 @@ test('dispose 会清掉待发与定时器', () => {
   assert.equal(clock.pending(), 0)
   clock.advance(5000)
   assert.equal(sent.length, 0)
+})
+
+test('父会话 idle 但子代理还在跑：不报「完成」，改发「进行中」并带上子代理数', () => {
+  const { scheduler, sent, clock, session } = createScheduler({ subagents: 2 })
+  scheduler.onTurnEnd({ session, event: turnEnd(1), text: '收口前的回答' })
+  clock.advance(5000)
+
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].kind, 'progress', '子代理在跑时绝不能标成 final')
+  assert.equal(sent[0].subagentsRunning, 2)
+  assert.equal(sent[0].text, '收口前的回答')
+  assert.equal(sent[0].turns, 1)
+  assert.equal(scheduler.pendingCount(), 0, '这一封已经发出去了，不该再等出第二封')
+})
+
+test('notifyProgress: false + 子代理还在跑：继续等，等它们跑完才发收尾那封', () => {
+  const { scheduler, sent, clock, session, subagentState } = createScheduler({
+    notifyProgress: false,
+    quietSeconds: 0,
+    subagents: 1,
+  })
+  scheduler.onTurnEnd({ session, event: turnEnd(1), text: '第一轮' })
+  clock.advance(0)
+  assert.equal(sent.length, 0, '低噪音模式不能因为子代理而多发一封')
+  assert.equal(clock.pending(), 1, '要继续等子代理跑完')
+
+  subagentState.value = 0
+  clock.advance(1000)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].kind, 'final')
+  assert.equal(sent[0].turns, 1)
+})
+
+test('子代理跑完后恢复完成判定：下一轮收尾照常报「完成」', () => {
+  const { scheduler, sent, clock, session, subagentState } = createScheduler({ subagents: 1 })
+  scheduler.onTurnEnd({ session, event: turnEnd(1), text: '第一轮' })
+  clock.advance(5000)
+  assert.equal(sent[0].kind, 'progress')
+
+  subagentState.value = 0
+  scheduler.onTurnEnd({ session, event: turnEnd(2), text: '第二轮' })
+  clock.advance(5000)
+  assert.equal(sent.length, 2)
+  assert.equal(sent[1].kind, 'final')
 })
 
 test('turn/start 重复到达只发一次「进行中」，收尾仍只发一封', () => {

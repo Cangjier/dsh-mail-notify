@@ -2,7 +2,7 @@
   "name": "dsh-mail-notify",
   "version": "0.1.0",
   "private": true,
-  "description": "DeepSeek Harness 插件：agent 每结束一轮回答，就发一封通知邮件。零依赖，只用 Node 内置模块。",
+  "description": "DeepSeek Harness 插件：agent 每结束一轮回答，就发一封通知邮件；向用户提问时也会立刻发一封。零依赖，只用 Node 内置模块。",
   "type": "module",
   "license": "MIT",
   "exports": {

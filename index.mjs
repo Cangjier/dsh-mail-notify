@@ -1,12 +1,18 @@
 /**
- * dsh-mail-notify：agent 每结束一轮回答，就发一封通知邮件。
+ * dsh-mail-notify：agent 每结束一轮回答，就发一封通知邮件； 向用户提问时也会立刻发一封。
  *
  * 本包以 bundle 形式装进 dsh profile（`dsh.profile.bundles` + `link:` 依赖），
  * 由同目录的 `cordis.patch.yml` 插入一行。它是纯 ESM、零依赖的：SMTP 见
  * `smtp.mjs`，邮件组装见 `mime.mjs`，都不引用任何 harness 包或第三方包。
  *
- * 触发点是每一条 `turn/end`（一轮回答结束），正文取该轮最后一条助手消息的文本，
- * 标题在固定前缀之后带上这轮回答的摘要（首个标题或首行，可用 `subjectSummary` 关掉）。
+ * 触发点有两个：
+ * - 每一条 `turn/end`（一轮回答结束），正文取该轮最后一条助手消息的文本；
+ * - 每一条 `user-questions/request`（agent 向用户提问），立刻发一封提醒，因为这一轮会停在原地等人回答。
+ * 标题在固定前缀之后带上这轮回答 / 第一个问题的摘要（可用 `subjectSummary` 关掉）。
+ *
+ * 父会话停下来不等于整段任务结束：Agent Teams / 子代理会另开会话继续跑，父会话在等它们时
+ * 已经是 idle。所以收尾那一封会先看名下还有没有正在跑的子代理会话——有就绝不报「任务完成」，
+ * 中途通知开着时改报「进行中（N 个子代理仍在跑）」，关着时等它们跑完再发收尾那封。
  *
  * @module dsh-mail-notify
  */
@@ -90,6 +96,14 @@ const DEFAULT_SUBJECT = 'DSH 任务完成'
 const DEFAULT_SUBJECT_PROGRESS = 'DSH 任务进行中'
 
 /**
+ * 默认主题前缀（**agent 向用户提问**那一封）。
+ *
+ * 提问和「一轮结束」是两件事：`ask_user_question` 会让这一轮停在原地等人回答，
+ * 用户不在界面前就永远等下去。所以这一封不等到轮次结束、提问一发生就发。
+ */
+const DEFAULT_SUBJECT_QUESTION = 'DSH 等待你的回答'
+
+/**
  * 按**发件**邮箱域名推断的 IMAP 端点，用于「收信触发」。
  *
  * 与 SMTP 一样只由发件账号决定；不支持 STARTTLS 的服务器不要写在这里，
@@ -130,15 +144,41 @@ const CWD_AUTO = 'auto'
 /** `reply_status` 里最多列几条「最近一次轮询」的逐封判定。 */
 const STATUS_DECISIONS = 5
 
-/** 主题后缀：非正常结束时把真实结果写进主题，避免「任务完成」四个字误导人。 */
-const REASON_SUFFIX = {
+/**
+ * 本插件自己投递的用户消息用的 `source.kind`（见 `userMessage()`）。
+ *
+ * 它**不在** `skipSources` 的默认值里，但可以自己加进去——加之前先看清代价：
+ * 「回信」就是那条轮次通知本身，跳过它等于回复邮件之后收不到答案邮件。
+ * 这个 kind 也不是本插件专属：宿主的 `@deepseek-ai/dsh-cordis-host-runner`
+ * 上报动态插件失败、注入运行时上下文时用的就是它（`agent.steer` / `agent.inject`），
+ * 所以按 kind 跳过会连带跳掉那些通知——真要跳本插件自己的邮件又没有专属 kind，
+ * 这一条是取舍，不是精确匹配。
+ */
+const MAIL_SOURCE_KIND = 'cordis-host-runner'
+
+/**
+ * `skipSources` 的出厂默认：这些 `user/message` 来源（`source.kind`）整轮不发通知。
+ *
+ * 默认只跳 `schedule`——`dsh-schedule` 投递的定时提醒
+ * （`createUserMessage({ source: { kind: 'schedule' } })` + `agent.followup()`）：
+ * 提醒正文不是「你的任务」，为它发一封「任务完成」只会是噪音。
+ *
+ * 想跳更多来源就自己往列表里加 kind（空数组 = 一个都不跳）：
+ * `'cordis-host-runner'` 本插件自己的邮件 + 宿主的动态插件失败上报、
+ * `'goal'` 目标自动续跑、`'webhook'`、`'agent-message'`/`'subagent-settled'` 代理间消息、
+ * `'tool-jobs'` 后台任务通知……列表里没写的来源一律照常发信。
+ */
+export const DEFAULT_SKIP_SOURCES = Object.freeze(['schedule'])
+
+/** 结束原因的中文标签：非正常结束时把真实结果拼进主题后缀，避免「任务完成」四个字误导人。 */
+const REASON_LABELS = {
   completed: '',
-  aborted: '（已取消）',
-  blocked: '（已阻塞）',
-  error: '（出错）',
-  'max-tokens': '（输出达到上限）',
-  interrupted: '（被中断）',
-  forked: '（已分叉）',
+  aborted: '已取消',
+  blocked: '已阻塞',
+  error: '出错',
+  'max-tokens': '输出达到上限',
+  interrupted: '被中断',
+  forked: '已分叉',
 }
 
 /** 标题里固定前缀与摘要之间的分隔符。 */
@@ -229,6 +269,26 @@ function requireBoolean(value, field) {
 function optionalBoolean(value, field, fallback) {
   if (value === undefined || value === null) return fallback
   return requireBoolean(value, field)
+}
+
+/**
+ * 校验「输入来源 kind」列表（`skipSources`）。
+ *
+ * 只认字符串数组，每项非空；`undefined`/`null` 取默认值。**空数组是合法的**，
+ * 意思是「一个来源都不跳」——那正是关掉这个过滤的写法。这里不做去重也不做排序：
+ * 顺序无关紧要，而原样保留能让 `status` 把用户写的值原样报回去。
+ * @param {unknown} value - 待校验的值。
+ * @param {string} field - 出错信息里显示的字段名。
+ * @param {readonly string[]} fallback - 值缺省时的默认值。
+ * @returns {string[]} 归一化后的列表。
+ * @throws {TypeError} 值存在但不是「非空字符串数组」时。
+ */
+function optionalSourceList(value, field, fallback) {
+  if (value === undefined || value === null) return [...fallback]
+  if (!Array.isArray(value)) {
+    throw new TypeError(`dsh-mail-notify: ${field} 必须是字符串数组（写 [] 表示一个都不跳），当前值为 ${JSON.stringify(value)}`)
+  }
+  return value.map((item, index) => requireNonEmptyString(item, `${field}[${index}]`))
 }
 
 /**
@@ -328,6 +388,9 @@ export function normalizeConfig(raw) {
     subject: optionalNonEmptyString(config.subject, 'config.subject') ?? DEFAULT_SUBJECT,
     subjectProgress: optionalNonEmptyString(config.subjectProgress, 'config.subjectProgress') ?? DEFAULT_SUBJECT_PROGRESS,
     notifyProgress: optionalBoolean(config.notifyProgress, 'config.notifyProgress', true),
+    notifyQuestions: optionalBoolean(config.notifyQuestions, 'config.notifyQuestions', true),
+    subjectQuestion:
+      optionalNonEmptyString(config.subjectQuestion, 'config.subjectQuestion') ?? DEFAULT_SUBJECT_QUESTION,
     finalQuietSeconds: optionalNonNegativeInt(config.finalQuietSeconds, 'config.finalQuietSeconds', 5),
     subjectSummary: optionalBoolean(config.subjectSummary, 'config.subjectSummary', true),
     subjectSummaryChars: optionalPositiveInt(config.subjectSummaryChars, 'config.subjectSummaryChars', 40),
@@ -340,6 +403,7 @@ export function normalizeConfig(raw) {
     authCodeEnv: optionalNonEmptyString(config.authCodeEnv, 'config.authCodeEnv') ?? 'QQ_SMTP_AUTH_CODE',
     authCodeFile: optionalNonEmptyString(config.authCodeFile, 'config.authCodeFile') ?? resolvePath(HERE, 'secret.txt'),
     skipSubagentSessions: optionalBoolean(config.skipSubagentSessions, 'config.skipSubagentSessions', true),
+    skipSources: optionalSourceList(config.skipSources, 'config.skipSources', DEFAULT_SKIP_SOURCES),
     mergeSteps: optionalBoolean(config.mergeSteps, 'config.mergeSteps', false),
     maxBodyChars: optionalPositiveInt(config.maxBodyChars, 'config.maxBodyChars', 20_000),
     includeSessionInfo: optionalBoolean(config.includeSessionInfo, 'config.includeSessionInfo', false),
@@ -613,12 +677,35 @@ function composeBody(config, session, event, text, token = null) {
 }
 
 /**
+ * 拼主题后缀：把非正常结束的原因与「还有子代理在跑」合并进同一对括号。
+ *
+ * 分开拼会出现「（出错）（2 个子代理仍在跑）」这种叠括号；合并成一条读起来才是
+ * 一个完整的补充说明。
+ * @param {{ kind: string }} reason - 这一轮的结束原因。
+ * @param {number} subagentsRunning - 仍在运行的子代理会话数。
+ * @returns {string} 后缀；没有要说明的返回空串。
+ */
+function subjectSuffix(reason, subagentsRunning) {
+  const labels = []
+  const reasonLabel = REASON_LABELS[reason.kind] ?? reason.kind
+  if (reasonLabel !== '') labels.push(reasonLabel)
+  if (subagentsRunning > 0) labels.push(`${subagentsRunning} 个子代理仍在跑`)
+  return labels.length === 0 ? '' : `（${labels.join('，')}）`
+}
+
+/**
  * 组装一封通知邮件的主题与正文。
  *
- * 两种邮件的差别只在标题前缀，以及「全部结束」那一封会先说清这是一波任务的收尾：
- * - `progress`：某一轮结束、但任务还在继续（下一轮已经开始了）→ 前缀 `subjectProgress`。
- * - `final`：整段跑完（agent 回到 idle）→ 前缀 `subject`（默认「DSH 任务完成」）。
- * 两种都带上这一轮的回答正文，所以一轮的任务只会收到一封、且是 `final`。
+ * 两种邮件的差别在标题前缀，以及「全部结束」那一封会先说清这是一波任务的收尾：
+ * - `progress`：某一轮结束、但任务还在继续（下一轮已经开始了，或子代理还在跑）→
+ *   前缀 `subjectProgress`。
+ * - `final`：整段跑完（agent 回到 idle，且名下没有正在跑的子代理会话）→
+ *   前缀 `subject`（默认「DSH 任务完成」）。
+ * 两种都带上这一轮的回答正文。
+ *
+ * `subagentsRunning > 0` 时标题一定不会出现「任务完成」：调度器会把这种情况标成
+ * `progress`（中途通知关掉时则干脆等它们跑完再发 `final`），这里再补一句
+ * 「（N 个子代理仍在跑）」，让标题本身就说明为什么还没结束。
  * @param {object} config - 归一化后的配置。
  * @param {object} options - 内容来源。
  * @param {'progress' | 'final'} options.kind - 邮件类型。
@@ -626,19 +713,160 @@ function composeBody(config, session, event, text, token = null) {
  * @param {{ turn: number, reason: object }} options.event - 对应那一轮的 `turn/end`。
  * @param {string} options.text - 对应那一轮的回答文本。
  * @param {string | null} [options.token] - 会话 token。
+ * @param {number} [options.subagentsRunning] - 仍在运行的子代理会话数。
  * @returns {{ prefix: string, subject: string, body: string }} 前缀、主题与正文。
  */
-export function composeNotification(config, { kind, session, event, text, token = null }) {
+export function composeNotification(config, { kind, session, event, text, token = null, subagentsRunning = 0 }) {
   const prefix = kind === 'final' ? config.subject : config.subjectProgress
-  const suffix = REASON_SUFFIX[event.reason.kind] ?? `（${event.reason.kind}）`
+  const suffix = subjectSuffix(event.reason, subagentsRunning)
   const subject = composeSubject(prefix, suffix, text, config)
   const answer = composeBody(config, session, event, text, token)
-  if (kind === 'progress') return { prefix, subject, body: answer }
+  if (kind === 'progress') {
+    if (subagentsRunning > 0) {
+      return {
+        prefix,
+        subject,
+        body: `（本轮已结束，但还有 ${subagentsRunning} 个子代理会话在跑，整段任务尚未结束。）\n\n${answer}`,
+      }
+    }
+    return { prefix, subject, body: answer }
+  }
+  if (subagentsRunning > 0) {
+    // 防御性分支：调度器不会在有子代理在跑时把邮件标成 final，但直接调用者可能。
+    return {
+      prefix,
+      subject,
+      body: `（这一轮已结束，但还有 ${subagentsRunning} 个子代理会话在跑，整段任务尚未结束。）\n\n${answer}`,
+    }
+  }
   return {
     prefix,
     subject,
     body: `本次任务已全部结束（${event.turn} 轮）。\n\n${answer}`,
   }
+}
+
+/**
+ * 从一批问题里挑一句能进标题的话。
+ *
+ * 与回答摘要同样只做本地推断：取第一条有题面的问题，剥掉 Markdown 标记后按
+ * `subjectSummaryChars` 截断。没有题面时返回空串（标题就只剩固定前缀）。
+ * @param {unknown} questions - `user-questions/request` 里的问题数组。
+ * @param {number} limit - 摘要最多多少个字符。
+ * @returns {string} 摘要；取不到时为空串。
+ */
+function summarizeQuestion(questions, limit) {
+  if (!Array.isArray(questions)) return ''
+  for (const question of questions) {
+    const text = question?.question
+    if (typeof text !== 'string' || text.trim() === '') continue
+    // 只有 Markdown 标记的题面（例如一行 `###`）清洗后是空串；跳过它继续看下一题，
+    // 不让标题白白丢掉一个可用的摘要。
+    const summary = plainTextLine(text)
+    if (summary !== '') return clipCharacters(summary, limit)
+  }
+  return ''
+}
+
+/**
+ * 汇总一封「提问通知」的正文：逐个问题列出题面、可选项，最后写清去哪儿回答。
+ *
+ * 排版是给人看的纯文本，不是 Markdown 表格：邮件客户端很多不渲染 Markdown，
+ * 缩进和短横线在纯文本里也读得清。
+ * @param {object} config - 归一化后的配置。
+ * @param {object} options - 内容来源。
+ * @param {unknown} options.questions - `user-questions/request` 里的问题数组。
+ * @param {object | null} options.session - 提问所属会话（没有 agent 的编程式提问时为 null）。
+ * @param {boolean} [options.canReply] - 正文里附了会话 token 时为 true。
+ * @returns {string} 邮件正文。
+ */
+function composeQuestionBody(config, { questions, session, canReply = false }) {
+  const list = Array.isArray(questions) ? questions.filter((question) => typeof question === 'object' && question !== null) : []
+  const lines = [list.length > 1 ? `智能体正在等你回答下面 ${list.length} 个问题：` : '智能体正在等你回答下面的问题：']
+  if (list.length === 0) {
+    lines.push('', '（这封通知没有带出问题正文，请回到 DSH 界面查看。）')
+  }
+
+  list.forEach((question, index) => {
+    lines.push('')
+    const header = typeof question.header === 'string' && question.header.trim() !== '' ? `【${question.header.trim()}】` : ''
+    const text = typeof question.question === 'string' && question.question.trim() !== '' ? question.question.trim() : '（没有题面）'
+    lines.push(`${index + 1}. ${header}${text}`)
+
+    // 计划审阅这类问题会把待审内容放进 detail：原样带出来，比只发一句「请审阅」有用。
+    if (typeof question.detail === 'string' && question.detail.trim() !== '') {
+      const label = question.intent?.kind === 'plan-review' ? '（待审阅的计划）' : '（补充内容）'
+      lines.push(`   ${label}`)
+      for (const line of question.detail.trim().split(/\r?\n/)) lines.push(`   ${line}`)
+    }
+
+    const options = Array.isArray(question.options) ? question.options : []
+    for (const option of options) {
+      if (typeof option !== 'object' || option === null) continue
+      const label = typeof option.label === 'string' && option.label.trim() !== '' ? option.label.trim() : '（未命名选项）'
+      const description = typeof option.description === 'string' ? option.description.trim() : ''
+      lines.push(`   - ${label}${description === '' ? '' : `：${description}`}`)
+    }
+    if (question.multiSelect === true || question.multi_select === true) lines.push('   （可以多选）')
+  })
+
+  let body = lines.join('\n')
+  // 按码点截断，别把 emoji 或代理对切成半个；字数也按码点报。
+  const characters = Array.from(body)
+  if (characters.length > config.maxBodyChars) {
+    body = `${characters.slice(0, config.maxBodyChars).join('')}\n\n…（正文共 ${characters.length} 字，已截断到前 ${config.maxBodyChars} 字）`
+  }
+
+  // 提醒放在截断之后：问题再长，这两句也不能被截掉。
+  body += '\n\n请回到 DSH 界面里回答（这封邮件只是提醒，问题要在界面里答）。'
+  if (canReply) {
+    body += '\n直接回复本邮件不会提交答案，只会作为这条会话的后续消息排队（等这次提问被回答后才会被读到）。'
+  }
+  if (config.includeSessionInfo) {
+    body += `\n\n--\n会话: ${session?.id ?? '（未知）'}\n目录: ${session?.header?.cwd ?? '（未知）'}\n时间: ${new Date().toISOString()}`
+  }
+  return body
+}
+
+/**
+ * 提问通知专用的 token 页脚。
+ *
+ * 不复用 `sessionTokenFooter()`：那句「回复本邮件可以继续这条对话」对提问通知会误导——
+ * 回信只会排进这条会话的后续消息，问题本身仍然要在界面里回答（非 timed 的提问没有超时，
+ * 界面不答就一直等）。token 行本身的格式与通用页脚一致，`stripTokenLines()` 照样能在
+ * 把邮件交给模型之前把它剥掉。
+ * @param {string} token - 会话 token。
+ * @returns {string} 可直接接在正文后面的页脚。
+ */
+function questionTokenFooter(token) {
+  return [
+    '',
+    '——',
+    `[${token}]`,
+    '回信会作为这条会话的后续消息排队，要等你在界面里回答完这次提问后才会被读到；问题本身请在界面回答。',
+  ].join('\n')
+}
+
+/**
+ * 组装一封「提问通知」的主题与正文。
+ *
+ * 与轮次通知的区别：这一封由 `user-questions/request` 触发，此刻那一轮**还没有结束**，
+ * 所以正文里没有结束原因、没有「全部结束」，只有一个明确的提醒——去界面回答问题。
+ * @param {object} config - 归一化后的配置。
+ * @param {object} options - 内容来源。
+ * @param {unknown} options.questions - `user-questions/request` 里的问题数组。
+ * @param {object | null} [options.session] - 提问所属会话。
+ * @param {string | null} [options.token] - 会话 token（只有存在会话时才给）；给出时正文末尾附专属页脚。
+ * @returns {{ prefix: string, subject: string, body: string }} 前缀、主题与正文。
+ */
+export function composeQuestionNotification(config, { questions, session = null, token = null }) {
+  const prefix = config.subjectQuestion
+  const summary = config.subjectSummary ? summarizeQuestion(questions, config.subjectSummaryChars) : ''
+  const subject = summary === '' ? prefix : `${prefix}${SUBJECT_SUMMARY_SEPARATOR}${summary}`
+  let body = composeQuestionBody(config, { questions, session, canReply: token !== null })
+  // token 页脚放在最后：即使上面被截断，它也不会被截掉。
+  if (token !== null) body += `\n${questionTokenFooter(token)}`
+  return { prefix, subject, body }
 }
 
 /**
@@ -652,16 +880,23 @@ export function composeNotification(config, { kind, session, event, text, token 
  *
  * 因此单轮任务只发一封（标题是「完成」），多轮任务才会多出几封「进行中」。
  * 关掉 `notifyProgress` 后中途那些轮不再单独发信，只在最后汇总发一封。
+ *
+ * 父会话 idle 也不等于整段任务结束：Agent Teams / 子代理会另开会话继续跑，父会话
+ * 在等它们时本来就是 idle。所以窗口到期后还要问一句「名下还有没有正在跑的子代理」：
+ * - 有、且中途通知开着 → 立刻发一封「进行中（N 个子代理仍在跑）」，不报「完成」；
+ * - 有、且中途通知关着 → 继续等（重新武装安静窗口），等它们跑完再发收尾那封；
+ * - 没有 → 正常发「完成」。
  * @param {object} options - 依赖注入，便于用假时钟测试。
  * @param {object} options.config - 归一化后的配置。
  * @param {(sessionId: string) => boolean} options.isIdle - 这个会话是不是已经停稳。
+ * @param {(sessionId: string) => number} [options.runningSubagents] - 这个会话名下还有几个子代理会话在跑。
  * @param {(payload: object) => Promise<void> | void} options.deliver - 真正发信。
  * @param {(level: string, message: string) => void} [options.log] - 日志。
  * @param {typeof setTimeout} [options.schedule] - 定时器（测试可注入假时钟）。
  * @param {typeof clearTimeout} [options.cancel] - 取消定时器。
  * @returns {{ onTurnEnd: Function, onTurnStart: Function, pendingCount: () => number, dispose: () => void }} 调度器。
  */
-export function createTurnScheduler({ config, isIdle, deliver, log = () => {}, schedule = setTimeout, cancel = clearTimeout }) {
+export function createTurnScheduler({ config, isIdle, runningSubagents = () => 0, deliver, log = () => {}, schedule = setTimeout, cancel = clearTimeout }) {
   /** @type {Map<string, object>} 每个会话当前这一波任务的累积。 */
   const pending = new Map()
   const quietMs = config.finalQuietSeconds * 1000
@@ -676,8 +911,14 @@ export function createTurnScheduler({ config, isIdle, deliver, log = () => {}, s
     }
   }
 
+  /**
+   * 等子代理跑完时的重新检查间隔：至少一秒，避免 `finalQuietSeconds: 0` 时
+   * 每次 setTimeout(0) 都立刻回来自旋。
+   */
+  const SUBAGENT_HOLD_MS = 1000
+
   /** （重新）武装安静窗口：窗口内又有新轮就重来。 */
-  const arm = (entry) => {
+  const arm = (entry, delay = quietMs) => {
     if (entry.timer !== undefined) cancel(entry.timer)
     entry.timer = schedule(() => {
       entry.timer = undefined
@@ -685,6 +926,25 @@ export function createTurnScheduler({ config, isIdle, deliver, log = () => {}, s
       // 还在跑（例如新的一轮已经开始、但我们没收到 turn/start）：不发「全部结束」，继续等。
       if (!isIdle(entry.sessionId)) {
         arm(entry)
+        return
+      }
+      // 父会话 idle 但子代理还在跑：整段任务没有结束，标题绝不能是「任务完成」。
+      const subagentsRunning = runningSubagents(entry.sessionId)
+      if (subagentsRunning > 0) {
+        // 低噪音模式（notifyProgress: false）下一封都不能多发：等它们跑完再发收尾那封。
+        if (!config.notifyProgress) {
+          arm(entry, Math.max(quietMs, SUBAGENT_HOLD_MS))
+          return
+        }
+        pending.delete(entry.sessionId)
+        send({
+          kind: 'progress',
+          subagentsRunning,
+          session: entry.session,
+          event: entry.event,
+          text: entry.text,
+          turns: entry.turns,
+        })
         return
       }
       pending.delete(entry.sessionId)
@@ -695,7 +955,7 @@ export function createTurnScheduler({ config, isIdle, deliver, log = () => {}, s
         text: entry.text,
         turns: entry.turns,
       })
-    }, quietMs)
+    }, delay)
     entry.timer?.unref?.()
   }
 
@@ -755,30 +1015,25 @@ export function createTurnScheduler({ config, isIdle, deliver, log = () => {}, s
 }
 
 /**
- * 真正发信：逐个收件人单独投递，避免收件人之间互相看到地址。
+ * 真正把一封通知投递出去：dryRun 只记日志，否则逐个收件人单独发，避免互相看到地址。
  *
- * 收信触发器在场时，正文末尾会附一段会话 token，并在全部投递成功后把它登记下来——
- * 之后你回复这封通知，插件就靠这段 token 认出该往哪条会话里追加消息（比主题可靠：
- * 你改了标题也照样认得出）。
+ * 轮次通知和提问通知共用这一段——两者的差别只在主题与正文怎么组装，
+ * 投递方式（dryRun、授权码、逐个收件人）必须完全一致。
  * @param {object} ctx - Cordis 插件上下文，用于日志。
  * @param {object} config - 归一化后的配置。
- * @param {{ kind: 'progress' | 'final', session: object, event: object, text: string }} payload - 调度器给出的内容。
- * @param {object | null} [replyPoller] - 收信触发器（可选）：取 token、登记通知。
- * @returns {Promise<void>} 全部收件人处理完后结束。
+ * @param {{ kind: string, subject: string, body: string, token?: string | null }} message - 主题、正文与类型。
+ * @returns {Promise<boolean>} 真的发出去了返回 true；dryRun 下返回 false（没有投递）。
  * @throws {Error} 缺少授权码，或 SMTP 投递失败时。
  */
-async function deliver(ctx, config, payload, replyPoller = null) {
-  const token = replyPoller?.createNotificationToken?.() ?? null
-  const { subject, body } = composeNotification(config, { ...payload, token })
-
+async function sendNotification(ctx, config, { kind, subject, body, token = null }) {
   if (config.dryRun) {
     ctx.logger.info(
-      `mail-notify: dryRun 已开启，未发送。kind=${payload.kind} subject=${subject} to=${config.to.join(', ')} body=${body.length} 字${
+      `mail-notify: dryRun 已开启，未发送。kind=${kind} subject=${subject} to=${config.to.join(', ')} body=${body.length} 字${
         token === null ? '' : ` token=${token}`
       }`,
     )
     ctx.logger.info(`mail-notify: dryRun 正文（最多显示 2000 字）:\n${body.slice(0, 2000)}`)
-    return
+    return false
   }
 
   const authCode = readAuthCode(config)
@@ -803,7 +1058,48 @@ async function deliver(ctx, config, payload, replyPoller = null) {
     })
     ctx.logger.info(`mail-notify: 已发送「${subject}」到 ${recipient}`)
   }
-  replyPoller?.rememberNotification?.(payload.session.id, subject, token ?? undefined)
+  return true
+}
+
+/**
+ * 投递一封轮次通知（某一轮结束）。
+ *
+ * 收信触发器在场时，正文末尾会附一段会话 token，并在**真的投递成功后**把它登记下来——
+ * 之后你回复这封通知，插件就靠这段 token 认出该往哪条会话里追加消息（比主题可靠：
+ * 你改了标题也照样认得出）。dryRun 下没有真的发出去，也就不登记。
+ * @param {object} ctx - Cordis 插件上下文，用于日志。
+ * @param {object} config - 归一化后的配置。
+ * @param {{ kind: 'progress' | 'final', session: object, event: object, text: string }} payload - 调度器给出的内容。
+ * @param {object | null} [replyPoller] - 收信触发器（可选）：取 token、登记通知。
+ * @returns {Promise<void>} 全部收件人处理完后结束。
+ * @throws {Error} 缺少授权码，或 SMTP 投递失败时。
+ */
+async function deliver(ctx, config, payload, replyPoller = null) {
+  const token = replyPoller?.createNotificationToken?.() ?? null
+  const { subject, body } = composeNotification(config, { ...payload, token })
+  const sent = await sendNotification(ctx, config, { kind: payload.kind, subject, body, token })
+  if (sent) replyPoller?.rememberNotification?.(payload.session.id, subject, token ?? undefined)
+}
+
+/**
+ * 投递一封「提问通知」（agent 正在等用户回答）。
+ *
+ * 有会话时才取 token 并登记：没有会话的编程式提问（`ask()` 不带 agent）既没有可追加的
+ * 目标，也不该在正文里承诺「回复会排进会话」。登记之后用户回复它时，插件能靠 token
+ * 认出会话（回复会被当作这条会话的后续消息排队，而不是提交答案——正文里已经写明）。
+ * @param {object} ctx - Cordis 插件上下文，用于日志。
+ * @param {object} config - 归一化后的配置。
+ * @param {{ questions?: unknown }} request - `user-questions/request` 的请求。
+ * @param {object | null} session - 提问所属会话；没有 agent 的编程式提问时为 null。
+ * @param {object | null} [replyPoller] - 收信触发器（可选）：取 token、登记通知。
+ * @returns {Promise<void>} 全部收件人处理完后结束。
+ * @throws {Error} 缺少授权码，或 SMTP 投递失败时。
+ */
+async function deliverQuestion(ctx, config, request, session, replyPoller = null) {
+  const token = session === null ? null : (replyPoller?.createNotificationToken?.() ?? null)
+  const { subject, body } = composeQuestionNotification(config, { questions: request?.questions, session, token })
+  const sent = await sendNotification(ctx, config, { kind: 'question', subject, body, token })
+  if (sent && session !== null) replyPoller?.rememberNotification?.(session.id, subject, token ?? undefined)
 }
 
 /**
@@ -818,6 +1114,9 @@ async function deliver(ctx, config, payload, replyPoller = null) {
  * 这里不用 harness 的 `createUserMessage()`：本包是零依赖的 `link:` 插件，不能
  * import 宿主内部模块。会话侧只校验 `id` 非空、`role` 与事件类型匹配、
  * `content` 是数组、`source.kind` 非空，所以字面量对象就是合法输入。
+ *
+ * `source.kind` 取 {@link MAIL_SOURCE_KIND}：它是判定「这一轮要不要发信」的依据之一，
+ * 也是会话里那条消息显示的生产者标签。
  * @param {string} text - 消息正文。
  * @returns {object} 用户消息。
  */
@@ -826,7 +1125,7 @@ function userMessage(text) {
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: 'cordis-host-runner' },
+    source: { kind: MAIL_SOURCE_KIND },
   }
 }
 
@@ -1374,6 +1673,13 @@ export function renderReplyStatus(config, poller) {
     }`,
     `状态文件：${replyStatePath(config)}`,
   ]
+  if (config.skipSources.includes(MAIL_SOURCE_KIND)) {
+    lines.push(
+      `注意：skipSources 含 ${MAIL_SOURCE_KIND}，所以邮件触发的那一轮不发通知——` +
+        '而「回信」就是那条通知本身，等于你回复邮件后收不到答案邮件，只能在界面里看结果。' +
+        `只想跳定时任务就把它去掉：skipSources: ['schedule']。`,
+    )
+  }
   if (poller !== null && poller !== undefined) {
     const notifications = poller.state.notifications ?? []
     const newest = notifications.at(-1)
@@ -1536,9 +1842,33 @@ function renderStatus(state) {
     )
     lines.push(
       config.notifyProgress
-        ? `中途通知：开启，任务连跑多轮时每轮发一封「进行中」（安静 ${config.finalQuietSeconds} 秒后仍未继续才算整段结束）`
+        ? config.enabled
+          ? `中途通知：开启，任务连跑多轮时每轮发一封「进行中」（安静 ${config.finalQuietSeconds} 秒后仍未继续才算整段结束）`
+          : '中途通知：配置为开启，但总开关 enabled 为 false，实际不会注册监听器、不会发信'
         : `中途通知：关闭，只在整段任务结束时发一封（安静 ${config.finalQuietSeconds} 秒判定）`,
     )
+    lines.push(
+      config.notifyQuestions
+        ? config.enabled
+          ? `提问通知：开启，agent 提问时立刻发一封「${config.subjectQuestion}」（问题要在 DSH 界面里回答）`
+          : '提问通知：配置为开启，但总开关 enabled 为 false，实际不会注册监听器、不会发信'
+        : '提问通知：关闭，agent 提问时不发信',
+    )
+    lines.push(
+      '子代理：父会话 idle 但名下还有子代理会话在跑时不报「任务完成」——中途通知开着就改发' +
+        '「进行中（N 个子代理仍在跑）」，关着就等它们跑完再发收尾那封',
+    )
+    lines.push(
+      config.skipSources.length === 0
+        ? '跳过来源：无（任何来源发起的轮次都会发信）'
+        : `跳过来源：${config.skipSources.join('、')}——这些来源发起的轮次整轮不发信（既不发「进行中」也不发「完成」，也不会把上一轮降级成进行中）`,
+    )
+    if (config.skipSources.includes(MAIL_SOURCE_KIND)) {
+      lines.push(
+        `  注意：${MAIL_SOURCE_KIND} 既包含本插件自己投递的邮件，也包含宿主动态插件 runner 的失败上报；` +
+          '跳过前者意味着回复邮件触发的那一轮不再回信（那条通知就是回信本身）。',
+      )
+    }
     lines.push(`授权码：${describeAuthCodeSource(config)}`)
     lines.push('')
     lines.push(renderReplyStatus(config, state.poller ?? null))
@@ -1566,7 +1896,14 @@ function renderGuide() {
     '  标题分两种：中途每轮是「DSH 任务进行中｜本轮摘要」，整段任务跑完那一封是',
     '  「DSH 任务完成｜最后一轮摘要」（正文开头写清「本次任务已全部结束（N 轮）」）。',
     '  不想要中途那些封就写 notifyProgress: false，一个任务只发一封。',
+    '  父会话停下来、但子代理（Agent Teams 成员等）还在跑时不会报「任务完成」：中途通知开着会先发',
+    '  一封「DSH 任务进行中（N 个子代理仍在跑）｜摘要」，关着就等它们跑完再发收尾那封。',
     '  标题摘要默认开启，不想要就写 subjectSummary: false。',
+    '  agent 提问（ask_user_question）时也会立刻发一封「DSH 等待你的回答｜问题摘要」，',
+    '  正文列出问题与选项，提醒你回界面回答；不想要就写 notifyQuestions: false。',
+    '  定时提醒（dsh-schedule）那一轮默认整轮不发信，也不会把你正跑着的任务降级成「进行中」；',
+    '  要跳别的来源就往 skipSources 里加 kind（如 cordis-host-runner = 本插件自己的邮件触发，',
+    '  代价是回复邮件后不再回信），写 [] 表示一个都不跳。',
     '  注意 patch 是整体替换 config：这段会覆盖本包 cordis.patch.yml 里的默认值，所以要从 enabled 开始写全。',
     '',
     '第 2 步 · 放授权码',
@@ -1623,9 +1960,11 @@ function registerGuideTool(toolsCtx, state, logger) {
     name: 'mail_notify',
     description: [
       'Inspect, configure, or test the dsh-mail-notify plugin: it emails the agent answer when a turn ends,',
+      'sends an immediate notice when the agent asks the user a question (ask_user_question),',
       'and it can also start a NEW conversation when a mail arrives (the "reply trigger").',
+      'A turn started by a skipped input source (config skipSources, default only dsh-schedule reminders) is never announced at all - no progress mail, no completion mail, and it does not turn the previous turn\'s completion mail into a progress one.',
       'Replying to a notice appends to that notice\'s conversation; a mail whose subject is exactly one of the configured create phrases (by default 「创建对话」/「创建新对话」/「新建对话」) always starts a brand-new conversation whose first prompt is the mail body verbatim.',
-      'action "status" reports whether mail will actually be sent, which SMTP endpoint was resolved, and the reply-trigger state;',
+      'action "status" reports whether mail will actually be sent, which SMTP endpoint was resolved, which input sources are skipped, and the reply-trigger state;',
       'action "guide" returns the exact file paths plus a ready-to-paste YAML snippet for turning either direction on;',
       'action "test" sends one real test email immediately (optionally to other recipients via "to");',
       'action "reply_status" explains the reply trigger: keyword, allowlist, IMAP endpoint, UID watermark, create-conversation phrases, and the per-mail verdicts of the last poll;',
@@ -1826,9 +2165,114 @@ export function apply(ctx, rawConfig) {
     return agent === undefined || agent.status !== 'running'
   }
 
+  /**
+   * 这个会话名下还有几个子代理会话在跑。
+   *
+   * 为什么要单独判：Agent Teams / 子代理会另开会话继续跑，父会话在等它们时已经是
+   * idle；只看父会话就会把「我还有 3 个成员在干活」报成「任务完成」。实时注册表
+   * （`agents.list()`）是唯一事实来源：只有 `status === 'running'` 的子代理才算在跑，
+   * 会话血缘（`header.parentSession`，可跨多层）用于只统计本会话的后代。
+   *
+   * 拿不到 agents 服务或读不到会话头时返回 0：按原来的行为发「完成」，宁可少一次
+   * 提示也不让邮件因为探测失败而彻底卡住。
+   * @param {string} sessionId - 发起这一波任务的会话 id。
+   * @returns {number} 仍在运行的子代理会话数。
+   */
+  const runningSubagentsOf = (sessionId) => {
+    const agents = ctx.get('agents')
+    if (agents === undefined || agents === null || typeof agents.list !== 'function') return 0
+    let live
+    try {
+      live = agents.list()
+    } catch {
+      return 0
+    }
+    if (!Array.isArray(live)) return 0
+    /** @type {Map<string, string | undefined>} 会话 id → 它的父会话 id。 */
+    const parentOf = new Map()
+    for (const agent of live) {
+      const id = agent?.session?.id
+      if (typeof id === 'string' && id !== '') parentOf.set(id, agent?.session?.header?.parentSession)
+    }
+    /** 沿父链判断这个子代理是不是本会话的后代（跨多层，防环）。 */
+    const isDescendant = (agent) => {
+      const seen = new Set()
+      let cursor = agent?.session?.header?.parentSession
+      while (typeof cursor === 'string' && !seen.has(cursor)) {
+        if (cursor === sessionId) return true
+        seen.add(cursor)
+        cursor = parentOf.get(cursor)
+      }
+      return false
+    }
+    let count = 0
+    for (const agent of live) {
+      if (agent?.session?.header?.origin !== 'subagent') continue
+      if (agent?.status !== 'running') continue
+      if (isDescendant(agent)) count += 1
+    }
+    return count
+  }
+
+  /** 每个会话当前这一轮的「发起来源」账本；键随会话回收。 */
+  const turnSources = new WeakMap()
+
+  /**
+   * 这一轮即将领取的那批输入分别是什么来源（`source.kind`）。
+   *
+   * 为什么在 `turn/start` 就能看到：驱动循环是「先 `append('turn/start')`，再
+   * `preStep` → `inbox.claim('next-turn', turn)`」，而 `session/event` 是同步派发的，
+   * 所以这个事件到达监听器时那批消息**还在收件箱里**；第一批领取的正好是
+   * `nextStep` 全部 + 一条 `nextTurn`（`Inbox.claim` 的语义）。于是定时提醒
+   * （`schedule`）在这一刻就已经认得出，不必等这一轮跑完——
+   * 这正是「跳过的那一轮不该把上一轮降级成进行中」需要的时机。
+   *
+   * 读不到 agents/inbox（服务缺失、替身不全、宿主实现换了）时返回 null：
+   * 按「不是自动化」处理，宁可多发一封也不漏一封；`user/message` 那条路还会再兜一次。
+   * @param {object} session - 会话。
+   * @returns {string[] | null} 来源 kind 列表；读不到收件箱时为 null。
+   */
+  const peekTurnSources = (session) => {
+    const agents = ctx.get('agents')
+    if (agents === undefined || agents === null || typeof agents.get !== 'function') return null
+    const agent = agents.get(session.id)
+    const inbox = agent?.inbox
+    if (inbox === undefined || inbox === null) return null
+    const claimed = [...(inbox.nextStep ?? []), ...(inbox.nextTurn ?? []).slice(0, 1)]
+    const kinds = []
+    for (const message of claimed) {
+      const kind = message?.source?.kind
+      if (typeof kind === 'string' && kind !== '') kinds.push(kind)
+    }
+    return kinds
+  }
+
+  /**
+   * 这一轮是不是「自动化任务」发起的：本轮见过的输入来源里有 `skipSources` 列出的 kind。
+   *
+   * 来源有两个，都是宿主给的事实，互为补充：
+   * - `turn/start` 那一刻从收件箱读到的那批（见 `peekTurnSources`）；
+   * - 之后写进会话日志的 `user/message.source.kind`——`'user'` 是人类（`Agent.followup()`/
+   *   `steer()` 只在调用方省略 source 时才默认成它），`'schedule'` 是定时提醒。
+   * 只有「第一个 user/message」是不够的：一轮里先落进日志的可能是注入的上下文
+   * （`agent-instructions`、`runtime-context`），发起方那条排在后面，所以按集合判定。
+   *
+   * 轮号对不上、或两个来源都没给出证据时返回 false——宁可多发一封，也不漏一封。
+   * @param {object} session - 会话。
+   * @param {number} turn - 轮号。
+   * @returns {boolean} 是否应当整轮跳过。
+   */
+  const automatedTurn = (session, turn) => {
+    const entry = turnSources.get(session)
+    if (entry === undefined || entry.turn !== turn) return false
+    for (const kind of entry.kinds) if (config.skipSources.includes(kind)) return true
+    return false
+  }
+
   const scheduler = createTurnScheduler({
     config,
     isIdle: agentIsIdle,
+    runningSubagents: runningSubagentsOf,
     deliver: (payload) => {
       // 监听器/定时器都不能阻塞：把发送排进队列，失败只记日志。
       queue = queue.then(() => deliver(ctx, config, payload, replyPoller)).catch((error) => {
@@ -1846,14 +2290,32 @@ export function apply(ctx, rawConfig) {
   ctx.effect(() => () => scheduler.dispose(), 'mail-notify.turns()')
 
   ctx.on('session/event', (session, event) => {
+    if (event.type === 'user/message') {
+      // `user/message` 的 `data` 就是消息本身（`'user/message': UserMessage`），带 source 和 id，
+      // 但不带轮号——所以只能记到「`turn/start` 打开的那一轮」上。顺序是安全的：
+      // 循环先 append turn/start，再在第一步 claim 并把输入 append 成 user/message，
+      // 而 assistant/message 总在它们之后。
+      const entry = turnSources.get(session)
+      const kind = event.data?.source?.kind
+      if (entry !== undefined && typeof kind === 'string' && kind !== '') entry.kinds.push(kind)
+      return
+    }
+
     if (event.type === 'assistant/message') {
-      if (config.enabled && wanted(session)) record(session, event)
+      // 自动化来源那一轮整轮不记录，于是它既不会发「进行中」也不会发「完成」。
+      if (config.enabled && wanted(session) && !automatedTurn(session, event.data.turn)) record(session, event)
       return
     }
 
     if (event.type === 'turn/start') {
+      const turn = event.data.turn
+      // 来源先看收件箱里即将被领取的那批（定时提醒在这一刻就已经认得出），
+      // 之后的 `user/message` 还会继续往这份账本里补。
+      const kinds = peekTurnSources(session)
+      turnSources.set(session, { turn, kinds: kinds ?? [] })
       // 新一轮开始了 ⇒ 上一轮只是「中途」，立刻把它发出去（标题是「进行中」）。
-      if (config.enabled && wanted(session)) scheduler.onTurnStart(session)
+      // 但自动化那一轮不算「中途」：它整轮不发信，也不该把上一轮的收尾邮件降级成进行中。
+      if (config.enabled && wanted(session) && !automatedTurn(session, turn)) scheduler.onTurnStart(session)
       return
     }
 
@@ -1862,15 +2324,57 @@ export function apply(ctx, rawConfig) {
     // 记住最近一次有活动的会话目录：邮件触发的新对话默认在同一个项目里干活。
     replyPoller?.rememberCwd(session.header?.cwd)
 
+    const automated = automatedTurn(session, event.data.turn)
+    turnSources.delete(session)
     if (!config.enabled) return
     const open = openTurns.get(session)
     openTurns.delete(session)
     if (open === undefined || open.turn !== event.data.turn) return
-    if (!wanted(session)) return
+    if (!wanted(session) || automated) return
 
     // 不在这里直接发信：先交给调度器等「安静窗口」，看这一轮是真结束还是还要继续。
     scheduler.onTurnEnd({ session, event: event.data, text: selectAnswerText(config, open) })
   })
+
+  /**
+   * 提问通知：agent 调用 `ask_user_question`（或任何走 `ctx.userQuestions` 的问答）时立刻发一封。
+   *
+   * 为什么挂在 `user-questions/request` 瀑布上，而不是等轮次结束：提问会让这一轮停在原地
+   * 等人回答，用户不在界面（或界面没开着）时就一直等——最需要提醒的正是这一刻。
+   *
+   * `prepend: true` 是必须的，不是优化：宿主 `@deepseek-ai/dsh-api-remotes` 也监听这个
+   * 事件，它把 agent 作用域的问题转发给客户端；正常答题（result）时它直接返回、**不调用
+   * `next()`**，注册在它后面的监听器在真机上根本轮不到（只有取消等非 result 结局才会往下传）。
+   * 放在最外层、先把发信排好再立刻 `next()`，既不影响客户端答题，也不会因为 SMTP 慢而
+   * 拖住问题的呈现。
+   *
+   * 发信本身只排进 `queue`（与轮次通知串行），这里不 await：任何阻塞都会让用户更晚
+   * 看到问题。通知出问题也只记日志，绝不能连累提问本身。
+   * @param {{ questions?: unknown, agent?: { session?: object }, signal?: { aborted?: boolean } }} request - 一次问答请求。
+   * @param {() => unknown} next - 瀑布链的下一环（宿主转发器 / 最终答不上来的兜底）。
+   * @returns {unknown} `next()` 的返回值，原样交还给调用方。
+   */
+  const onQuestionRequest = (request, next) => {
+    try {
+      // 已经被取消的提问不必提醒；`ask()` 自己也会在入口拦这种请求，这里只是顺手对齐。
+      if (config.notifyQuestions && typeof request === 'object' && request !== null && request.signal?.aborted !== true) {
+        const session = request.agent?.session ?? null
+        if (session === null || wanted(session)) {
+          queue = queue.then(() => deliverQuestion(ctx, config, request, session, replyPoller)).catch((error) => {
+            const detail = error instanceof Error ? error.stack ?? error.message : String(error)
+            ctx.logger.error(`mail-notify: 发送「提问通知」失败: ${detail}`)
+          })
+        }
+      }
+    } catch (error) {
+      ctx.logger.error(`mail-notify: 处理提问通知失败：${messageOf(error)}`)
+    }
+    // 正常情况一定是 waterfall，`next` 是链的下一环；万一宿主换了分发方式（没有 next），
+    // 也不能让通知把这次提问弄崩。
+    return typeof next === 'function' ? next() : undefined
+  }
+
+  if (config.enabled && config.notifyQuestions) ctx.on('user-questions/request', onQuestionRequest, { prepend: true })
 
   if (replyPoller !== null) {
     const intervalMs = config.reply.intervalSeconds * 1000
